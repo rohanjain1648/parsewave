@@ -1,10 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import type { ChatBackend } from "./chatBackend";
 import {
   CODE_ALPHABET,
   CODE_LENGTH,
   MAX_NAME_LENGTH,
   MAX_PLAYERS,
+  MAX_SPECTATORS,
   RECONNECT_GRACE_MS,
+  SPECTATOR_SLOT,
   normalizeCode,
   type ClientToRelay,
   type RelayToClient,
@@ -30,6 +33,15 @@ interface Room {
   code: string;
   started: boolean;
   members: Map<number, Member>;
+  spectators: Set<Conn>;
+  /** Nexconn channel ids, unique per room so a reused code never inherits old chat. */
+  squadId: string;
+  watchId: string;
+  /** In-flight or finished channel creation; each happens once per room. */
+  squadReady: Promise<void> | null;
+  /** The host's chat id, so clients can tell real vote news from a forged message. */
+  hostChatId: string | null;
+  watchReady: Promise<void> | null;
 }
 
 /**
@@ -44,6 +56,7 @@ export class RoomManager {
   constructor(
     private readonly now: () => number = Date.now,
     private readonly rand: () => number = Math.random,
+    private readonly chat: ChatBackend | null = null,
   ) {}
 
   get roomCount(): number {
@@ -68,11 +81,16 @@ export class RoomManager {
       if (m.t === "host") this.host(c, m.name);
       else if (m.t === "join") this.join(c, m.code, m.name);
       else if (m.t === "rejoin") this.rejoin(c, m.code, m.token);
+      else if (m.t === "watch") this.watch(c, m.code);
       return;
     }
 
     const { room, slot } = at;
-    if (m.t === "send") {
+    if (m.t === "chatJoin") {
+      void this.chatJoin(c, room, slot, String(m.userId ?? ""));
+    } else if (slot === SPECTATOR_SLOT) {
+      // Spectators only watch and chat; nothing else they send reaches the room.
+    } else if (m.t === "send") {
       const msg: RelayToClient = { t: "msg", from: slot, data: m.data };
       if (slot !== 0) this.sendTo(room, 0, msg);
       else if (typeof m.to === "number") this.sendTo(room, m.to, msg);
@@ -92,6 +110,7 @@ export class RoomManager {
     for (const mem of at.room.members.values()) {
       if (mem.slot !== 0 && mem.conn) mem.conn.send(data);
     }
+    for (const fan of at.room.spectators) fan.send(data);
   }
 
   onClose(c: Conn): void {
@@ -101,6 +120,11 @@ export class RoomManager {
     const { room, slot } = at;
     if (slot === 0) {
       this.closeRoom(room);
+      return;
+    }
+    if (slot === SPECTATOR_SLOT) {
+      room.spectators.delete(c);
+      this.sendRoster(room);
       return;
     }
     const mem = room.members.get(slot);
@@ -127,7 +151,18 @@ export class RoomManager {
 
   // ---- Handlers ------------------------------------------------------------
   private host(c: Conn, name: string): void {
-    const room: Room = { code: this.newCode(), started: false, members: new Map() };
+    const id = randomBytes(10).toString("hex");
+    const room: Room = {
+      code: this.newCode(),
+      started: false,
+      members: new Map(),
+      spectators: new Set(),
+      squadId: `sq${id}`,
+      watchId: `w${id}`,
+      squadReady: null,
+      hostChatId: null,
+      watchReady: null,
+    };
     this.rooms.set(room.code, room);
     this.admit(c, room, 0, name);
   }
@@ -167,6 +202,44 @@ export class RoomManager {
     this.sendRoster(room);
   }
 
+  private watch(c: Conn, rawCode: string): void {
+    const code = normalizeCode(String(rawCode ?? ""));
+    if (!code) return this.error(c, "bad_code");
+    const room = this.rooms.get(code);
+    if (!room) return this.error(c, "not_found");
+    if (room.spectators.size >= MAX_SPECTATORS) return this.error(c, "watch_full");
+    room.spectators.add(c);
+    this.byConn.set(c, { room, slot: SPECTATOR_SLOT });
+    this.send(c, { t: "welcome", code: room.code, slot: SPECTATOR_SLOT, token: "" });
+    this.sendRoster(room);
+  }
+
+  /**
+   * Hand a client the room's chat channels, creating them on first use. The
+   * relay does this (not the browser) because it knows who is really in the
+   * room, and only the server may hold the Nexconn secret. A failure only
+   * costs chat: the game itself never waits on it.
+   */
+  private async chatJoin(c: Conn, room: Room, slot: number, userId: string): Promise<void> {
+    if (!this.chat || !userId) return this.send(c, { t: "chatOff" });
+    const chat = this.chat;
+    if (slot === 0) room.hostChatId = userId;
+    try {
+      room.watchReady ??= chat.createWatch(room.watchId);
+      if (slot === SPECTATOR_SLOT) {
+        await room.watchReady;
+        return this.send(c, { t: "chat", squadId: null, watchId: room.watchId, hostUserId: room.hostChatId });
+      }
+      room.squadReady ??= chat.createSquad(room.squadId, userId);
+      await Promise.all([room.watchReady, room.squadReady]);
+      await chat.addToSquad(room.squadId, userId);
+      this.send(c, { t: "chat", squadId: room.squadId, watchId: room.watchId, hostUserId: room.hostChatId });
+    } catch (e) {
+      console.error("chat setup failed:", (e as Error).message);
+      this.send(c, { t: "chatOff" });
+    }
+  }
+
   // ---- Helpers -------------------------------------------------------------
   private admit(c: Conn, room: Room, slot: number, name: string): void {
     const mem: Member = { slot, name: cleanName(name), token: randomUUID(), conn: c, droppedAt: null };
@@ -186,6 +259,18 @@ export class RoomManager {
         mem.conn.close();
       }
     }
+    for (const fan of room.spectators) {
+      this.byConn.delete(fan);
+      this.send(fan, { t: "closed", reason: "host_left" });
+      fan.close();
+    }
+    if (this.chat && (room.squadReady || room.watchReady)) {
+      this.chat
+        .closeChannels(room.squadReady ? room.squadId : null, room.watchReady ? room.watchId : null)
+        .catch(() => {
+          // Best effort: Nexconn also destroys idle open channels by itself.
+        });
+    }
   }
 
   private newCode(): string {
@@ -203,7 +288,7 @@ export class RoomManager {
   }
 
   private sendRoster(room: Room): void {
-    this.broadcast(room, { t: "roster", players: this.roster(room), started: room.started });
+    this.broadcast(room, { t: "roster", players: this.roster(room), started: room.started, spectators: room.spectators.size });
   }
 
   private broadcast(room: Room, m: RelayToClient, clientsOnly = false): void {
@@ -212,6 +297,7 @@ export class RoomManager {
       if (clientsOnly && mem.slot === 0) continue;
       mem.conn?.send(raw);
     }
+    for (const fan of room.spectators) fan.send(raw);
   }
 
   private sendTo(room: Room, slot: number, m: RelayToClient): void {

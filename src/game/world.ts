@@ -1,11 +1,11 @@
 import { SpatialGrid } from "../core/grid";
 import { angleTo, clamp, dist, dist2, len, RNG, TAU } from "../core/math";
 import type { Audio } from "../core/audio";
-import { COOP, PALETTE, PLAYER, WORLD, xpForLevel } from "./config";
+import { COOP, DIRECTOR, PALETTE, PLAYER, WORLD, xpForLevel } from "./config";
 import type { EnemyKind } from "./config";
 import { ARCHETYPES, isArchetypeId, type ArchetypeId } from "./archetypes";
 import { applyEffect, type Effect, type HapticKind } from "./effects";
-import { Director, initEnemy, ringPoint, shooterConfig } from "./enemies";
+import { chooseKind, Director, initEnemy, ringPoint, shooterConfig } from "./enemies";
 import { Particles } from "./particles";
 import { Player } from "./player";
 import { rollUpgrades, upgradeLabel, type Upgrade } from "./upgrades";
@@ -80,6 +80,8 @@ export class World {
   /** Co-op client: the boss bar comes from the host's snapshot, not a local boss. */
   bossHpOverride: number | null = null;
 
+  /** Watching without a robot: `localSlot` is just whoever the camera follows. */
+  spectating = false;
   /** Which player's screen this World drives (effects targeted elsewhere are skipped). */
   localSlot = 0;
   /** App only: vibrate for this player's own hits, level-ups and going down. */
@@ -382,6 +384,32 @@ export class World {
       p.facing = facing;
     }
     p.remoteFiring = firing;
+  }
+
+  /** The crowd voted to help: a heal gem lands next to every living player. */
+  crowdSupplyDrop(): void {
+    for (const p of this.players) {
+      if (!this.isLiving(p)) continue;
+      const [x, y] = ringPoint(p.x, p.y, 60, this.rng);
+      this.dropGem(x, y, 0, "heal");
+    }
+    this.emit({ k: "sfx", n: "levelup", slot: -1 });
+    this.emit({ k: "flash", color: "255,107,168", i: 0.35, slot: -1 });
+  }
+
+  /** The crowd voted for chaos: an extra wave rings the squad, within the usual enemy cap. */
+  crowdSurge(): void {
+    const living = this.players.filter((p) => this.isLiving(p));
+    if (living.length === 0) return;
+    const room = DIRECTOR.maxEnemies - this.aliveEnemyCount();
+    const n = Math.min(room, 6 + 2 * living.length);
+    for (let i = 0; i < n; i++) {
+      const p = living[i % living.length];
+      const [x, y] = ringPoint(p.x, p.y, this.viewRadius + 60, this.rng);
+      this.spawnEnemyAt(chooseKind(this.time, this.rng), x, y);
+    }
+    this.emit({ k: "sfx", n: "bossWarn", slot: -1 });
+    this.emit({ k: "trauma", v: 0.4, slot: -1 });
   }
 
   /** A player left the run for good: their robot and shots vanish. */

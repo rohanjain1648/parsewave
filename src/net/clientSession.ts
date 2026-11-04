@@ -78,7 +78,8 @@ export class ClientSession {
   /** One fixed tick: predict our own robot and send its pose. */
   step(dt: number, input: PlayerInput): void {
     const w = this.world;
-    if (!this.running || w.gameOver) return;
+    // A spectator (slot -1) has no robot to steer.
+    if (!this.running || w.gameOver || this.localSlot < 0) return;
     const p = w.player;
     if (p.active && !p.downed && !this.huddleOpen) w.stepPlayerMovement(p, input, dt);
 

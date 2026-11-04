@@ -152,9 +152,41 @@ try {
   const dirs = { a: "d", b: "a" };
   await a.keyboard.down(dirs.a);
   await b.keyboard.down(dirs.b);
+
   let aLevel = false;
   let bLevel = false;
   let sawHuddle = false;
+  // The squad keeps fighting and dodging while the spectator's page loads.
+  let watching = true;
+  const dodge = (async () => {
+    while (watching) {
+      await a.waitForTimeout(2500);
+      for (const [k, p] of [["a", a], ["b", b]]) {
+        await p.keyboard.up(dirs[k]);
+        dirs[k] = dirs[k] === "d" ? "a" : "d";
+        await p.keyboard.down(dirs[k]);
+        if ((await nova(p)).state === "levelup") {
+          sawHuddle = true;
+          await p.keyboard.press("Digit1");
+        }
+      }
+    }
+  })();
+  try {
+    // A spectator arrives by link mid-run, takes no slot, and sees the live match.
+    const c = await open("C", `?debug&watch=${code}`);
+    await waitFor(c, (s) => s.state === "playing" && s.mode === "spectator", "spectator watching", 90_000);
+    await waitFor(a, (s) => s.spectators === 1 && s.roster === 2, "host counts 1 spectator, still 2 players");
+    const watchedAt = (await nova(c)).time;
+    await waitFor(c, (s) => s.time > watchedAt, "spectator's view advancing", 30_000);
+    await shot(c, "3b-spectator-view");
+    await c.context().close();
+    await waitFor(a, (s) => s.spectators === 0, "host sees the spectator leave");
+  } finally {
+    watching = false;
+    await dodge;
+  }
+
   for (let i = 0; i < 120 && !(aLevel && bLevel); i++) {
     await a.waitForTimeout(350);
     if (i % 10 === 9) {
@@ -184,7 +216,7 @@ try {
   if (!sawHuddle) throw new Error("level rose without either player seeing the level-up cards");
 
   const fa = await nova(a);
-  console.log(`OK: room ${code}, 2 players, joiner movement seen by host, squad reached Lv ${fa.level} at t=${fa.time}s, no runtime errors`);
+  console.log(`OK: room ${code}, 2 players, joiner movement seen by host, spectator watched mid-run, squad reached Lv ${fa.level} at t=${fa.time}s, no runtime errors`);
 } catch (e) {
   console.error("COOP SMOKE FAIL:", e.message);
   exitCode = 1;
