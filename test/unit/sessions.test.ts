@@ -276,3 +276,24 @@ test("a snapshot from a different game version is flagged, not thrown", () => {
   expect(() => client.onSnapshot(bad.buffer)).not.toThrow();
   expect(client.versionMismatch).toBe(true);
 });
+
+test("a spectator session updates every robot and never sends a pose", () => {
+  now = 0;
+  cw = new World(silentAudio());
+  cwire = new FakeWire();
+  client = new ClientSession(cw, cwire, -1, () => now);
+  client.onHostMessage({ k: "start", slots: SLOTS });
+  wire.text.length = 0;
+  wire.onBinary = (b) => client.onSnapshot(b.buffer as ArrayBuffer);
+  hw.players[0].x = 123;
+  hw.players[1].x = 456;
+  for (let i = 0; i < 30; i++) {
+    host.step(DT, IDLE_INPUT);
+    now += 1000 / 60;
+    client.step(DT, { ...IDLE_INPUT, moveX: 1 });
+    client.frame(DT);
+  }
+  expect(cw.players[0].x).toBeCloseTo(123, 0);
+  expect(cw.players[1].x).toBeCloseTo(456, 0);
+  expect(cwire.text).toHaveLength(0);
+});

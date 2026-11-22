@@ -24,7 +24,9 @@ export class RelayClient {
   onStatus: (s: RelayStatus) => void = () => {};
 
   private ws: WebSocket | null = null;
-  private token = "";
+  /** What to send to get back in after a dropped socket. */
+  private resume: ClientToRelay | null = null;
+  private watchName = "";
   private pending: Pending | null = null;
   private leaving = false;
   private retryUntil = 0;
@@ -43,6 +45,14 @@ export class RelayClient {
     const clean = normalizeCode(code);
     if (!clean) return Promise.reject<{ code: string; slot: number }>("bad_code");
     return this.request({ t: "join", code: clean, name });
+  }
+
+  /** Watch a room as a spectator (no player slot; works mid-run). */
+  watch(code: string, name: string): Promise<{ code: string; slot: number }> {
+    const clean = normalizeCode(code);
+    if (!clean) return Promise.reject<{ code: string; slot: number }>("bad_code");
+    this.watchName = name;
+    return this.request({ t: "watch", code: clean, name });
   }
 
   send(m: ClientToRelay): void {
@@ -109,7 +119,9 @@ export class RelayClient {
     if (m.t === "welcome") {
       this.code = m.code;
       this.slot = m.slot;
-      this.token = m.token;
+      this.resume = m.token
+        ? { t: "rejoin", code: m.code, token: m.token }
+        : { t: "watch", code: m.code, name: this.watchName };
       this.setStatus("open");
       this.pending?.resolve({ code: m.code, slot: m.slot });
       this.pending = null;
@@ -139,7 +151,7 @@ export class RelayClient {
       this.setStatus("closed");
       return;
     }
-    if (this.leaving || !this.token) {
+    if (this.leaving || !this.resume) {
       this.setStatus("closed");
       return;
     }
@@ -153,7 +165,7 @@ export class RelayClient {
     }
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
-      if (!this.leaving) this.open({ t: "rejoin", code: this.code, token: this.token });
+      if (!this.leaving && this.resume) this.open(this.resume);
     }, 1000);
   }
 
@@ -163,6 +175,9 @@ export class RelayClient {
     this.onStatus(s);
   }
 }
+
+/** The same relay over HTTP, for /health and /chat/session. */
+export const relayHttpUrl = (url: string): string => url.replace(/^ws/, "http").replace(/\/+$/, "");
 
 /** The relay's ws(s):// URL from the build, or null when co-op isn't configured. */
 export function relayUrl(): string | null {
@@ -174,7 +189,7 @@ export function relayUrl(): string | null {
  * takes up to a minute to wake). Resolves false once `timeoutMs` runs out.
  */
 export async function wakeRelay(url: string, timeoutMs = 75_000): Promise<boolean> {
-  const health = url.replace(/^ws/, "http").replace(/\/+$/, "") + "/health";
+  const health = relayHttpUrl(url) + "/health";
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const ctrl = new AbortController();

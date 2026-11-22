@@ -140,3 +140,217 @@ body::after {
   border-color: #5b7bff;
   background: rgba(91, 123, 255, 0.18);
 }
+
+/* ---- Co-op chat ---- */
+.chat-panel {
+  position: fixed;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #eafcff;
+  font-size: 14px;
+}
+
+.chat-panel.mode-hidden {
+  display: none;
+}
+
+.chat-panel.mode-full {
+  top: 70px;
+  right: 12px;
+  bottom: 12px;
+  width: min(300px, 42vw);
+  padding: 10px;
+  border: 1.5px solid rgba(63, 233, 255, 0.35);
+  border-radius: 14px;
+  background: rgba(8, 10, 20, 0.86);
+  touch-action: pan-y;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.chat-panel.mode-full.collapsed {
+  bottom: auto;
+  width: auto;
+}
+
+.chat-panel.collapsed .chat-list,
+.chat-panel.collapsed .chat-form,
+.chat-panel.collapsed .chat-vote,
+.chat-panel.collapsed .chat-head > :not(.chat-toggle) {
+  display: none;
+}
+
+/* In a fight: a click-through list of recent lines, above the weapon chips. */
+.chat-panel.mode-feed {
+  left: 16px;
+  bottom: 62px;
+  width: min(340px, 60vw);
+  pointer-events: none;
+}
+
+.chat-panel.mode-feed .chat-head,
+.chat-panel.mode-feed .chat-form,
+.chat-panel.mode-feed .chat-vote {
+  display: none;
+}
+
+.chat-panel.mode-feed .chat-row {
+  animation: chat-fade 9s forwards;
+  text-shadow: 0 1px 3px #000;
+}
+
+@keyframes chat-fade {
+  0%, 75% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.chat-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.chat-head strong {
+  color: #3fe9ff;
+  letter-spacing: 0.06em;
+}
+
+.chat-watching {
+  color: rgba(230, 244, 255, 0.75);
+}
+
+.chat-crowd {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: rgba(230, 244, 255, 0.75);
+}
+
+.chat-toggle {
+  margin-left: auto;
+}
+
+.chat-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+
+.chat-row.crowd {
+  opacity: 0.8;
+}
+
+.chat-row.quick span {
+  font-style: italic;
+}
+
+.chat-panel button,
+.quick-bar button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  border: 1px solid rgba(230, 244, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.07);
+  padding: 4px 8px;
+}
+
+.chat-panel .chat-name {
+  border: 0;
+  background: none;
+  padding: 0 6px 0 0;
+  font-weight: 800;
+}
+
+.chat-panel.mode-feed .chat-name {
+  pointer-events: none;
+}
+
+.chat-form {
+  display: flex;
+  gap: 6px;
+}
+
+.chat-form input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  padding: 8px;
+  border: 1px solid rgba(230, 244, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #eafcff;
+}
+
+.chat-form input:focus,
+.chat-panel button:focus-visible,
+.quick-bar button:focus-visible {
+  outline: 2px solid #3fe9ff;
+  outline-offset: 1px;
+}
+
+.chat-vote:empty {
+  display: none;
+}
+
+.chat-vote {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 8px;
+  border: 1.5px solid #ffd27a;
+  border-radius: 10px;
+}
+
+.chat-vote-title {
+  grid-column: 1 / -1;
+  color: #ffd27a;
+  font-weight: 800;
+}
+
+.chat-vote button {
+  padding: 10px 4px;
+  font-weight: 800;
+}
+
+.chat-vote button.picked {
+  border-color: #ffd27a;
+  background: rgba(255, 210, 122, 0.2);
+}
+
+.chat-vote button:disabled {
+  cursor: default;
+}
+
+.quick-bar {
+  position: fixed;
+  z-index: 5;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  max-width: calc(100vw - 180px);
+  overflow: hidden;
+  color: #eafcff;
+  font-size: 13px;
+  touch-action: manipulation;
+}
+
+.quick-bar[hidden] {
+  display: none;
+}
+
+.quick-bar button {
+  white-space: nowrap;
+  padding: 8px 10px;
+  background: rgba(8, 10, 20, 0.8);
+}

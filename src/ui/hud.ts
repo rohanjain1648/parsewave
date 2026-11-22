@@ -125,12 +125,12 @@ export function drawHud(
   ctx.font = "700 13px 'Segoe UI', system-ui, sans-serif";
   ctx.fillStyle = "rgba(230,244,255,0.55)";
   ctx.fillText(muted ? "🔇 M" : "🔊 M", w - pad, 14);
-  ctx.fillText(world.players.length > 1 ? "ESC menu · G ping" : "ESC pause", w - pad, 34);
+  ctx.fillText(world.spectating ? "ESC menu" : world.players.length > 1 ? "ESC menu · G ping" : "ESC pause", w - pad, 34);
 
   if (world.players.length > 1) {
     drawTeammates(ctx, world, pad, 60);
     if (camera) drawEdgeArrows(ctx, world, camera, w, h);
-    drawPingButton(ctx, world, w, h);
+    if (!world.spectating) drawPingButton(ctx, world, w, h);
   }
 }
 

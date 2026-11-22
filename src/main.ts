@@ -22,7 +22,7 @@ import { toCard, type Upgrade, type UpgradeCard } from "./game/upgrades";
 import { Scene3D } from "./render/scene";
 import { FollowCamera } from "./render/camera3d";
 import { RobotFactory } from "./render/robots";
-import { WorldView } from "./render/worldView";
+import { WorldView, type FloatLabel } from "./render/worldView";
 import { drawFloatLabels } from "./ui/labels3d";
 import {
   coopGameOverRects,
@@ -35,14 +35,18 @@ import {
   randomCallsign,
 } from "./ui/lobby";
 import { askRoomCode } from "./ui/codeInput";
-import { RelayClient, relayUrl, wakeRelay } from "./net/relayClient";
+import { RelayClient, relayHttpUrl, relayUrl, wakeRelay } from "./net/relayClient";
+import { ChatController, type ChatRole } from "./chat/chatController";
+import { NexconnTransport } from "./chat/nexconnTransport";
+import { quickOptions, type QuickLine } from "./chat/quickChat";
+import { ChatPanel, type ChatPanelMode } from "./ui/chatPanel";
 import { HostSession } from "./net/hostSession";
 import { ClientSession } from "./net/clientSession";
 import type { ClientToHost, HostToClient, OverInfo } from "./net/gameProtocol";
-import type { ErrorReason, RelayToClient, RosterEntry } from "./net/relayProtocol";
+import { SPECTATOR_SLOT, type ErrorReason, type RelayToClient, type RosterEntry } from "./net/relayProtocol";
 
 type State = "loading" | "menu" | "lobby" | "playing" | "levelup" | "paused" | "gameover";
-type Mode = "solo" | "host" | "client";
+type Mode = "solo" | "host" | "client" | "spectator";
 
 const BEST_KEY = "novaswarm.best";
 const COOP_BEST_KEY = "novaswarm.best.coop";
@@ -85,6 +89,13 @@ let roster: RosterEntry[] = [];
 const callsign = randomCallsign();
 let toast: { text: string; until: number } | null = null;
 let joining = false;
+let chat: ChatController | null = null;
+let chatPanel: ChatPanel | null = null;
+let spectators = 0;
+let quickLines: QuickLine[] = [];
+let lastChatUiT = 0;
+/** Spectators: the slot the camera follows. */
+let followSlot = 0;
 
 if (RELAY_URL) {
   void wakeRelay(RELAY_URL).then((ok) => {
@@ -119,11 +130,14 @@ robotFactory
     // so a refresh doesn't re-join a room that has moved on).
     const params = new URLSearchParams(location.search);
     const code = params.get("room");
-    if (code) {
+    const watch = params.get("watch");
+    if (code || watch) {
       params.delete("room");
+      params.delete("watch");
       const qs = params.toString();
       history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
-      joinRoom(code);
+      if (watch) watchRoom(watch);
+      else if (code) joinRoom(code);
     }
   })
   .catch((err) => {
@@ -204,6 +218,7 @@ const JOIN_ERRORS: Record<ErrorReason | "unreachable", string> = {
   started: "That run already started",
   bad_code: "Codes are 4 letters/numbers",
   bad_token: "Couldn't rejoin that room",
+  watch_full: "This match has a full crowd right now",
   unreachable: "Couldn't reach the co-op server",
 };
 
@@ -235,6 +250,7 @@ function hostRoom(): void {
       mode = "host";
       hostSession = new HostSession(world, relay!);
       state = "lobby";
+      startChat("host", 0);
     })
     .catch((reason: ErrorReason | "unreachable") => {
       relay = null;
@@ -259,6 +275,7 @@ function joinRoom(code: string): void {
       mode = "client";
       clientSession = new ClientSession(world, relay!, slot);
       state = "lobby";
+      startChat("player", slot);
     })
     .catch((reason: ErrorReason | "unreachable") => {
       relay = null;
@@ -269,8 +286,117 @@ function joinRoom(code: string): void {
     });
 }
 
+/** Join a room's audience: no robot, just the live match and the crowd chat. */
+function watchRoom(code: string): void {
+  if (!RELAY_URL || joining) {
+    if (!RELAY_URL) showToast("Co-op unavailable");
+    return;
+  }
+  audio.unlock();
+  joining = true;
+  relay = newRelay();
+  relay
+    .watch(code, callsign)
+    .then(() => {
+      mode = "spectator";
+      clientSession = new ClientSession(world, relay!, SPECTATOR_SLOT);
+      world.spectating = true;
+      followSlot = 0;
+      state = "lobby";
+      startChat("spectator", SPECTATOR_SLOT);
+    })
+    .catch((reason: ErrorReason | "unreachable") => {
+      relay = null;
+      showToast(JOIN_ERRORS[reason] ?? "Couldn't open that match");
+    })
+    .finally(() => {
+      joining = false;
+    });
+}
+
+// --- Chat (Nexconn). Purely additive: if it's off or fails, co-op still works. ---
+function startChat(role: ChatRole, slot: number): void {
+  if (!RELAY_URL) return;
+  const c = new ChatController(new NexconnTransport(relayHttpUrl(RELAY_URL)), { role, name: callsign, slot });
+  chat = c;
+  chatPanel = new ChatPanel(
+    c,
+    role,
+    () => `${import.meta.env.VITE_PUBLIC_URL || `${location.origin}${location.pathname}`}?watch=${relay?.code ?? ""}`,
+    sendQuickAt,
+    (text) => showToast(text, 2500),
+  );
+  c.onVoteOpen = () => {
+    if (role !== "spectator") showToast("The crowd is voting…", 3000);
+  };
+  c.onCrowdResult = (choice, supply, surge) => {
+    const label = choice === "surge" ? "SWARM SURGE" : "SUPPLY DROP";
+    showToast(`The crowd chose ${label}! (${Math.max(supply, surge)}–${Math.min(supply, surge)})`, 4000);
+  };
+  void c.start((userId) => relay?.send({ t: "chatJoin", userId }));
+}
+
+function stopChat(): void {
+  chatPanel?.destroy();
+  chatPanel = null;
+  void chat?.stop();
+  chat = null;
+  spectators = 0;
+  quickLines = [];
+}
+
+function sendQuickAt(index: number): void {
+  const line = quickLines[index];
+  if (line) chat?.sendQuick(line);
+}
+
+/** Show the panel that fits this moment, a few times a second. */
+function updateChatUi(): void {
+  if (!chat || !chatPanel) return;
+  const now = performance.now();
+  if (now - lastChatUiT < 200) return;
+  lastChatUiT = now;
+
+  const inFight = state === "playing" && mode !== "spectator" && !world.player.downed && waitingNames().length === 0;
+  let panelMode: ChatPanelMode = "full";
+  if (state === "menu" || state === "loading") panelMode = "hidden";
+  else if (inFight || state === "levelup") panelMode = "feed";
+  chatPanel.setMode(panelMode);
+  chatPanel.setWatching(spectators);
+
+  quickLines = [];
+  if (state === "playing" && mode !== "spectator" && chat.status === "ready") {
+    quickLines = quickOptions({
+      meDowned: world.player.downed,
+      downedTeammates: world.players.filter((p) => p.active && p.downed && p.slot !== world.localSlot).map((p) => p.name),
+      bossAlive: world.bossHpFraction != null,
+    });
+  }
+  chatPanel.setQuick(quickLines);
+  chatPanel.tick();
+}
+
+/** Speech bubbles over robots, added after WorldView has rebuilt its labels. */
+function pushChatBubbles(labels: FloatLabel[]): void {
+  if (!chat) return;
+  for (const p of world.players) {
+    const text = p.active ? chat.bubbleFor(p.slot) : null;
+    if (text) labels.push({ x: p.x, y: 190, z: p.y, text: `“${text}”`, color: "#ffffff", alpha: 1, size: 16 });
+  }
+}
+
+/** Spectators: move the camera to the next robot still in the run. */
+function followNext(): void {
+  const active = world.players.filter((p) => p.active);
+  if (active.length === 0) return;
+  const i = active.findIndex((p) => p.slot === followSlot);
+  followSlot = active[(i + 1) % active.length].slot;
+}
+
 /** Drop out of co-op entirely and go back to the title. */
 function leaveCoop(reason?: string): void {
+  stopChat();
+  world.spectating = false;
   const r = relay;
   relay = null;
   r?.leave();
@@ -289,12 +415,22 @@ function leaveCoop(reason?: string): void {
 function onRelayMessage(m: RelayToClient): void {
   if (m.t === "roster") {
     roster = m.players;
+    spectators = m.spectators ?? 0;
     hostSession?.onRoster(m.players);
+    // Arriving mid-run: the host's "start" came before we did, so the roster
+    // stands in for it. Stats and positions arrive with the first snapshot.
+    if (mode === "spectator" && m.started && clientSession && !clientSession.isRunning) {
+      onHostMessage({ k: "start", slots: m.players.map((p) => ({ slot: p.slot, name: p.name })) });
+    }
+  } else if (m.t === "chat") {
+    void chat?.onChannels(m);
+  } else if (m.t === "chatOff") {
+    chat?.onChatOff();
   } else if (m.t === "closed") {
     leaveCoop("Host left the room");
   } else if (m.t === "msg") {
     if (mode === "host") hostSession?.onClientMessage(m.from, m.data as ClientToHost);
-    else if (mode === "client") onHostMessage(m.data as HostToClient);
+    else if (mode === "client" || mode === "spectator") onHostMessage(m.data as HostToClient);
   }
 }
 
@@ -318,6 +454,10 @@ function startCoopRun(): void {
 }
 
 function finishCoopRun(info: OverInfo): void {
+  if (mode === "spectator") {
+    state = "gameover";
+    return;
+  }
   const s: RunStats = { time: info.time, kills: info.kills, level: info.level };
   newBest = false;
   if (!coopBest || s.time > coopBest.time) {
@@ -401,6 +541,16 @@ function handlePlaying(dt: number): void {
     input.consumeConfirm();
     return;
   }
+  if (mode === "spectator") {
+    input.consumeConfirm();
+    if (input.consumeClick() || input.consumeKey("Tab")) followNext();
+    stepCoop(dt, IDLE_INPUT);
+    return;
+  }
+  if (mode !== "solo") {
+    const num = input.consumeNumber();
+    if (num > 0) sendQuickAt(num - 1);
+  }
   if (mode !== "solo") {
     stepCoop(dt, input.read());
     return;
@@ -422,9 +572,12 @@ function stepCoop(dt: number, inp: PlayerInput): void {
   }
   if (mode === "host" && hostSession) {
     hostSession.step(dt, inp);
+    const crowd = chat?.hostTick(dt, spectators > 0 && !hostSession.huddle && !world.gameOver, world.gameOver);
+    if (crowd === "supply") world.crowdSupplyDrop();
+    else if (crowd === "surge") world.crowdSurge();
     if (hostSession.overInfo && state !== "gameover") finishCoopRun(hostSession.overInfo);
     else if (state === "playing" && (hostSession.huddle?.cards.length ?? 0) > 0) state = "levelup";
-  } else if (mode === "client" && clientSession) {
+  } else if ((mode === "client" || mode === "spectator") && clientSession) {
     clientSession.step(dt, inp);
     if (clientSession.overInfo && state !== "gameover") finishCoopRun(clientSession.overInfo);
     else if (state === "playing" && clientSession.cards) state = "levelup";
@@ -587,7 +740,9 @@ function render(): void {
   }
 
   // A co-op client's World is written from host snapshots, once per frame.
-  if (mode === "client" && clientSession?.isRunning) clientSession.frame(rdt);
+  if (mode === "spectator") world.localSlot = followSlot;
+  if ((mode === "client" || mode === "spectator") && clientSession?.isRunning) clientSession.frame(rdt);
+  updateChatUi();
   if (clientSession?.versionMismatch) leaveCoop("Your friend is on a different version — refresh or update the game");
 
   // Sync the 3D scene from World's data + advance camera/atmosphere on the
@@ -598,6 +753,7 @@ function render(): void {
   scene3d.updateAtmosphere(rdt, world.player.x, world.player.y);
   scene3d.render();
 
+  pushChatBubbles(worldView.floatLabels);
   drawFloatLabels(hudCtx, worldView.floatLabels, scene3d.camera, W, H);
 
   if (state === "menu") {
@@ -628,7 +784,10 @@ function render(): void {
     drawHuddleWait(hudCtx, W, H, huddleNames);
   }
 
-  if (mode === "client" && clientSession?.hostPaused && relay?.status === "open") drawBanner(hudCtx, W, "Host paused — waiting for the host's game…");
+  if (mode === "spectator" && state === "playing" && !toast) {
+    drawBanner(hudCtx, W, `Watching ${world.player.name}  ·  tap to switch`, "#eafcff");
+  }
+  if ((mode === "client" || mode === "spectator") && clientSession?.hostPaused && relay?.status === "open") drawBanner(hudCtx, W, "Host paused — waiting for the host's game…");
   drawToast();
 }
 
@@ -689,6 +848,11 @@ if (new URLSearchParams(location.search).has("debug")) {
     slot: world.localSlot,
     roster: roster.length,
     players: world.players.filter((p) => p.active).length,
+    spectators,
+    chat: chat?.status ?? null,
+    chatFeed: chat?.feed.map((f) => f.text) ?? [],
+    toast: toast && performance.now() < toast.until ? toast.text : null,
+    liveEnemies: world.enemies.reduce((n, e) => n + (e.dead ? 0 : 1), 0),
     peers: world.players
       .filter((p) => p.active && p.slot !== world.localSlot)
       .map((p) => ({ slot: p.slot, x: Math.round(p.x), y: Math.round(p.y), maxHp: p.maxHp })),

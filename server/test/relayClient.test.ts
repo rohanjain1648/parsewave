@@ -122,3 +122,24 @@ test("the relay drops a silently dead host (missed heartbeat) and tells clients"
     await hb.close();
   }
 });
+
+test("a spectator watches through RelayClient, gets snapshots, and rejoins after a dropped socket", async () => {
+  const host = client();
+  const { code } = await host.host("H");
+  const fan = client();
+  const frames: ArrayBuffer[] = [];
+  const statuses: string[] = [];
+  fan.onBinary = (b) => frames.push(b);
+  fan.onStatus = (s) => statuses.push(s);
+  const res = await fan.watch(code.toLowerCase(), "FAN");
+  expect(res).toEqual({ code, slot: -1 });
+  host.sendBinary(new Uint8Array([1]));
+  await until(() => frames.length === 1);
+
+  const sockets = [...relay.wss.clients];
+  sockets[sockets.length - 1].terminate();
+  await until(() => statuses.includes("reconnecting"));
+  await until(() => fan.status === "open");
+  host.sendBinary(new Uint8Array([2]));
+  await until(() => frames.length === 2);
+});
