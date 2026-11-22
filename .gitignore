@@ -5,6 +5,14 @@ dist/
 .vscode/
 .vercel/
 npm-debug.log*
+*.log
 
 nova-mobile
 dist-coop/
+aholo/
+
+# Lux3D pipeline: raw downloads and task state stay local
+tools/lux3d/raw/
+tools/lux3d/state.json
+.env
+docs/report/auto/

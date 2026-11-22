@@ -1,5 +1,4 @@
-import { BOSS, ENEMIES, PALETTE } from "../game/config";
-import type { EnemyKind } from "../game/config";
+import { PALETTE } from "../game/config";
 import type { UpgradeCard } from "../game/upgrades";
 import type { RunStats } from "../game/world";
 import { formatTime } from "./hud";
@@ -68,122 +67,6 @@ export function primaryButtonRect(w: number, h: number): Rect {
   return { x: w / 2 - bw / 2, y: h * 0.62, w: bw, h: 56 };
 }
 
-/** Bounds of the title screen's "HOW TO PLAY" card — the single source of
- * truth for both drawing it and positioning the Play button beneath it, so
- * the two can never drift apart (e.g. the button overlapping the card on a
- * short/landscape viewport where a fixed fraction of `h` wouldn't leave
- * enough room for the card's fixed pixel height). */
-export function titlePanelRect(w: number, h: number): Rect {
-  const panelW = Math.min(640, w * 0.88);
-  return { x: w / 2 - panelW / 2, y: h * 0.42, w: panelW, h: 210 };
-}
-
-/** The title screen's Play button sits below the how-to-play card (game-over
- * reuses `primaryButtonRect` unshifted since it has different content above). */
-export function titlePlayButtonRect(w: number, h: number): Rect {
-  const bw = Math.min(280, w * 0.6);
-  const panel = titlePanelRect(w, h);
-  return { x: w / 2 - bw / 2, y: panel.y + panel.h + 48, w: bw, h: 56 };
-}
-
-/** How much the title's panel-through-buttons block is shrunk on short viewports. */
-const titleScale = (h: number): number => Math.min(1, Math.max(0.6, h / 760));
-
-/**
- * Screen-space bounds of the three title buttons. Solo sits exactly where the
- * old PLAY button did; Host/Join share a row beneath it. All three are laid
- * out pre-scale and mapped through the same transform `drawTitle` draws with,
- * so hit-testing matches what's on screen at any viewport height.
- */
-export function titleButtonRects(w: number, h: number): { solo: Rect; host: Rect; join: Rect } {
-  const play = titlePlayButtonRect(w, h);
-  const panelTop = titlePanelRect(w, h).y;
-  const s = titleScale(h);
-  const gap = 12;
-  const half = (play.w - gap) / 2;
-  const rowY = play.y + play.h + gap;
-  const map = (r: Rect): Rect => ({
-    x: w / 2 + (r.x - w / 2) * s,
-    y: panelTop + (r.y - panelTop) * s,
-    w: r.w * s,
-    h: r.h * s,
-  });
-  return {
-    solo: map(play),
-    host: map({ x: play.x, y: rowY, w: half, h: 48 }),
-    join: map({ x: play.x + half + gap, y: rowY, w: half, h: 48 }),
-  };
-}
-
-export type CoopAvailability = "ready" | "waking" | "unavailable";
-
-const ENEMY_LABELS: Record<EnemyKind, string> = {
-  grunt: "Grunt",
-  fast: "Fast",
-  tank: "Tank",
-  splitter: "Splitter",
-  shooter: "Shooter",
-  boss: "Warden",
-};
-
-interface LegendItem {
-  color: string;
-  label: string;
-}
-
-/**
- * A small caps section label, followed by a centered row of colored-dot legend
- * chips below it. The row shrinks (font, gap, dot size) to fit narrow/mobile
- * widths rather than overflowing off-screen — measured at a base size first,
- * then re-measured at the scaled-down size so spacing stays accurate.
- */
-function drawLegendRow(ctx: CanvasRenderingContext2D, w: number, y: number, sectionLabel: string, items: LegendItem[]): void {
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = "rgba(230,244,255,0.38)";
-  ctx.font = "800 10px 'Segoe UI', system-ui, sans-serif";
-  ctx.fillText(sectionLabel, w / 2, y);
-
-  const rowY = y + 20;
-  const available = w * 0.94;
-  const baseFontPx = 12;
-  const baseGap = 20;
-  const basePad = 15; // dot + spacing before each label
-
-  const measure = (fontPx: number) => {
-    ctx.font = `600 ${fontPx}px 'Segoe UI', system-ui, sans-serif`;
-    const pad = basePad * (fontPx / baseFontPx);
-    const widths = items.map((it) => pad + ctx.measureText(it.label).width);
-    const gap = baseGap * (fontPx / baseFontPx);
-    const total = widths.reduce((a, b) => a + b, 0) + gap * (items.length - 1);
-    return { widths, gap, total, pad };
-  };
-
-  let fontPx = baseFontPx;
-  let m = measure(fontPx);
-  if (m.total > available) {
-    const scale = Math.max(0.55, available / m.total);
-    fontPx = Math.round(baseFontPx * scale);
-    m = measure(fontPx);
-  }
-
-  const dotR = Math.max(3, 5 * (fontPx / baseFontPx));
-  let x = w / 2 - m.total / 2;
-
-  for (let i = 0; i < items.length; i++) {
-    const it = items[i];
-    ctx.beginPath();
-    ctx.fillStyle = it.color;
-    ctx.arc(x + dotR, rowY, dotR, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.textAlign = "left";
-    ctx.font = `600 ${fontPx}px 'Segoe UI', system-ui, sans-serif`;
-    ctx.fillStyle = "rgba(230,244,255,0.8)";
-    ctx.fillText(it.label, x + m.pad - 1, rowY);
-    x += m.widths[i] + m.gap;
-  }
-}
-
 export function drawButton(
   ctx: CanvasRenderingContext2D,
   r: Rect,
@@ -211,138 +94,6 @@ export function drawButton(
 
 export function muteButtonRect(w: number): Rect {
   return { x: w - 52, y: 16, w: 36, h: 36 };
-}
-
-// ---- Title screen --------------------------------------------------------
-export function drawTitle(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  h: number,
-  time: number,
-  best: RunStats | null,
-  muted: boolean,
-  coop: CoopAvailability = "unavailable",
-): void {
-  dim(ctx, w, h, 0.55);
-  neonTitle(ctx, "NOVA SWARM", w / 2, h * 0.28, Math.min(72, w * 0.11), time, w * 0.92);
-
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = "rgba(230,244,255,0.75)";
-  const taglineSize = fitFontSize(ctx, "Outlast the neon swarm. Level up. Build a deadly run.", 600, w * 0.92, 17);
-  ctx.font = `600 ${taglineSize}px 'Segoe UI', system-ui, sans-serif`;
-  ctx.fillText("Outlast the neon swarm. Level up. Build a deadly run.", w / 2, h * 0.28 + 52);
-
-  // ---- Dedicated "HOW TO PLAY" panel: a bordered card (same visual language
-  // as the level-up cards) so this reads as one clear section instead of
-  // loose floating text — controls, enemy roster, and weapons all in one place.
-  //
-  // The whole panel-through-button block is drawn inside a canvas transform
-  // that scales it down (anchored at the panel's top edge) on short viewports
-  // — e.g. mobile landscape — where the fixed pixel layout below would
-  // otherwise push the Play button off the bottom of the screen. On normal
-  // desktop/portrait heights `scale` is 1 and this is a no-op.
-  const panel = titlePanelRect(w, h);
-  const panelX = panel.x;
-  const panelTop = panel.y;
-  const panelH = panel.h;
-  const panelScale = titleScale(h);
-
-  ctx.save();
-  ctx.translate(w / 2, panelTop);
-  ctx.scale(panelScale, panelScale);
-  ctx.translate(-w / 2, -panelTop);
-
-  ctx.save();
-  roundRect(ctx, panelX, panelTop, panel.w, panelH, 16);
-  const panelGrad = ctx.createLinearGradient(panelX, panelTop, panelX, panelTop + panelH);
-  panelGrad.addColorStop(0, "rgba(20,28,48,0.55)");
-  panelGrad.addColorStop(1, "rgba(8,10,20,0.55)");
-  ctx.fillStyle = panelGrad;
-  ctx.fill();
-  ctx.strokeStyle = "rgba(63,233,255,0.35)";
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-  ctx.restore();
-
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = PALETTE.player;
-  ctx.font = "800 15px 'Segoe UI', system-ui, sans-serif";
-  ctx.fillText("HOW TO PLAY", w / 2, panelTop + 24);
-
-  const controlsMaxW = panel.w * 0.92;
-  const controls1 = "Move: WASD / Arrows  •  Hold click: aim + fire  •  Touch: drag";
-  const controls2 = "Pick upgrades on level-up  •  M mutes  •  ESC pauses";
-  const controlsSize = Math.min(
-    fitFontSize(ctx, controls1, 500, controlsMaxW, 14),
-    fitFontSize(ctx, controls2, 500, controlsMaxW, 14),
-  );
-  ctx.font = `500 ${controlsSize}px 'Segoe UI', system-ui, sans-serif`;
-  ctx.fillStyle = "rgba(230,244,255,0.55)";
-  ctx.fillText(controls1, w / 2, panelTop + 56);
-  ctx.fillText(controls2, w / 2, panelTop + 80);
-
-  // Enemy roster + weapon legend, sourced straight from the enemy/palette
-  // data so it can't drift out of sync with the actual in-game colors.
-  const enemyItems: LegendItem[] = (Object.keys(ENEMIES) as Exclude<EnemyKind, "boss">[]).map((k) => ({
-    color: ENEMIES[k].color,
-    label: ENEMY_LABELS[k],
-  }));
-  enemyItems.push({ color: BOSS.color, label: `${ENEMY_LABELS.boss} (boss)` });
-  drawLegendRow(ctx, w, panelTop + 116, "ENEMIES", enemyItems);
-
-  const weaponItems: LegendItem[] = [
-    { color: PALETTE.bullet, label: "Blaster" },
-    { color: PALETTE.orbital, label: "Orbital Shards" },
-    { color: PALETTE.nova, label: "Pulse Nova" },
-  ];
-  drawLegendRow(ctx, w, panelTop + 166, "WEAPONS", weaponItems);
-
-  if (best) {
-    const bestText = `BEST  ${formatTime(best.time)}  •  ${best.kills} kills  •  Lv ${best.level}`;
-    ctx.textAlign = "center";
-    ctx.fillStyle = PALETTE.xp;
-    const bestSize = fitFontSize(ctx, bestText, 700, panel.w * 0.92, 15);
-    ctx.font = `700 ${bestSize}px 'Segoe UI', system-ui, sans-serif`;
-    ctx.fillText(bestText, w / 2, panelTop + panelH + 28);
-  }
-
-  drawButton(ctx, titlePlayButtonRect(w, h), "▶  PLAY SOLO", time);
-  ctx.restore(); // closes the panelScale transform
-
-  // Co-op row (already in screen space).
-  const rects = titleButtonRects(w, h);
-  const fontPx = Math.round(15 * panelScale);
-  if (coop === "ready") {
-    drawButton(ctx, rects.host, "HOST CO-OP", time, "#5dffb0", fontPx);
-    drawButton(ctx, rects.join, "JOIN", time, "#5b7bff", fontPx);
-  } else {
-    const row: Rect = { x: rects.host.x, y: rects.host.y, w: rects.join.x + rects.join.w - rects.host.x, h: rects.host.h };
-    ctx.save();
-    ctx.globalAlpha = 0.45;
-    ctx.strokeStyle = "rgba(230,244,255,0.5)";
-    ctx.lineWidth = 1.5;
-    roundRect(ctx, row.x, row.y, row.w, row.h, 14);
-    ctx.stroke();
-    ctx.restore();
-    ctx.fillStyle = "rgba(230,244,255,0.6)";
-    ctx.font = `700 ${fontPx}px 'Segoe UI', system-ui, sans-serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(coop === "waking" ? "Waking co-op server…" : "Co-op unavailable", row.x + row.w / 2, row.y + row.h / 2);
-  }
-
-  // Mute toggle
-  const mb = muteButtonRect(w);
-  ctx.fillStyle = "rgba(255,255,255,0.06)";
-  roundRect(ctx, mb.x, mb.y, mb.w, mb.h, 8);
-  ctx.fill();
-  ctx.fillStyle = "rgba(230,244,255,0.8)";
-  ctx.font = "16px system-ui";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(muted ? "🔇" : "🔊", mb.x + mb.w / 2, mb.y + mb.h / 2);
 }
 
 // ---- Level-up ------------------------------------------------------------
@@ -437,26 +188,40 @@ export function drawLevelUp(
 }
 
 // ---- Pause ---------------------------------------------------------------
-export function resumeButtonRect(w: number, h: number): Rect {
+// A centred stack of three buttons (resume / sound / quit), sized to fit short
+// landscape phones. One slot helper so drawing and hit-testing never drift apart.
+function pauseSlot(w: number, h: number, i: number): Rect {
   const bw = Math.min(280, w * 0.6);
-  return { x: w / 2 - bw / 2, y: h * 0.55, w: bw, h: 56 };
+  const bh = h < 480 ? 44 : 52;
+  const gap = 12;
+  const startY = h * 0.6 - (bh * 3 + gap * 2) / 2;
+  return { x: w / 2 - bw / 2, y: startY + i * (bh + gap), w: bw, h: bh };
+}
+
+export function resumeButtonRect(w: number, h: number): Rect {
+  return pauseSlot(w, h, 0);
+}
+
+export function pauseMuteButtonRect(w: number, h: number): Rect {
+  return pauseSlot(w, h, 1);
 }
 
 export function quitButtonRect(w: number, h: number): Rect {
-  const bw = Math.min(280, w * 0.6);
-  return { x: w / 2 - bw / 2, y: h * 0.55 + 70, w: bw, h: 56 };
+  return pauseSlot(w, h, 2);
 }
 
-export function drawPause(ctx: CanvasRenderingContext2D, w: number, h: number, time: number): void {
+export function drawPause(ctx: CanvasRenderingContext2D, w: number, h: number, time: number, muted = false, showKeys = true): void {
   dim(ctx, w, h, 0.6);
-  neonTitle(ctx, "PAUSED", w / 2, h * 0.32, Math.min(52, w * 0.08), time, w * 0.9);
-  ctx.fillStyle = "rgba(230,244,255,0.6)";
-  ctx.font = "600 14px 'Segoe UI', system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText("ESC / SPACE to resume  •  Q to quit to menu", w / 2, h * 0.32 + 40);
-
+  neonTitle(ctx, "PAUSED", w / 2, h * 0.24, Math.min(52, w * 0.08), time, w * 0.9);
+  if (showKeys) {
+    ctx.fillStyle = "rgba(230,244,255,0.6)";
+    ctx.font = "600 14px 'Segoe UI', system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("ESC / SPACE to resume  •  M sound  •  Q to quit to menu", w / 2, h * 0.24 + 40);
+  }
   drawButton(ctx, resumeButtonRect(w, h), "▶  RESUME", time, PALETTE.player);
+  drawButton(ctx, pauseMuteButtonRect(w, h), muted ? "SOUND: OFF" : "SOUND: ON", time, muted ? PALETTE.danger : PALETTE.xp);
   drawButton(ctx, quitButtonRect(w, h), "✕  QUIT TO MENU", time, PALETTE.danger);
 }
 

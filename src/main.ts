@@ -4,24 +4,34 @@ import { Input } from "./core/input";
 import { GameLoop } from "./core/loop";
 import { IDLE_INPUT, type PlayerInput } from "./game/types";
 import { World, type RunStats } from "./game/world";
+import { phaseCallout, spaceBlend } from "./game/phaseBlend";
+import { INTRO_SECONDS, introWeight } from "./render/bossIntro";
+import type { Enemy } from "./game/types";
 import { drawHud, pingButtonRect } from "./ui/hud";
 import {
+  drawButton,
   drawGameOver,
   drawLevelUp,
   drawPause,
-  drawTitle,
   levelUpLayout,
   muteButtonRect,
+  pauseMuteButtonRect,
   pointInRect,
   quitButtonRect,
   resumeButtonRect,
-  titleButtonRects,
-  type CoopAvailability,
+  type Rect,
 } from "./ui/screens";
+import { platform } from "./platform";
+import { PerfScaler } from "./core/perf";
+import { ARCHETYPES, ARCHETYPE_LIST, type Archetype, type ArchetypeId } from "./game/archetypes";
+import { loadProfile, recordRunEnd, setLastSelected, type Profile } from "./game/profile";
+import { archetypeBackRect, archetypeSelectLayout, drawArchetypeSelect, drawUnlockToast } from "./ui/archetypeSelect";
+import { dashButtonRect, drawDashButton, drawPauseButton, drawTouchSticks, pauseButtonRect, type Insets } from "./ui/touchControls";
+import { drawTitle, titleButtonRects, titleFooterHit, titlePanelHit, type CoopAvailability } from "./ui/titleScreen";
 import { toCard, type Upgrade, type UpgradeCard } from "./game/upgrades";
 import { Scene3D } from "./render/scene";
 import { FollowCamera } from "./render/camera3d";
-import { RobotFactory } from "./render/robots";
+import { ModelLibrary } from "./render/modelLibrary";
 import { WorldView, type FloatLabel } from "./render/worldView";
 import { drawFloatLabels } from "./ui/labels3d";
 import {
@@ -34,7 +44,14 @@ import {
   lobbyButtonRects,
   randomCallsign,
 } from "./ui/lobby";
-import { askRoomCode } from "./ui/codeInput";
+import { askForgePrompt, askRoomCode } from "./ui/codeInput";
+import { ForgeClient, forgeStatusLine } from "./forge/forgeClient";
+import { pickGalleryBoss } from "./forge/gallery";
+import { Hangar } from "./render/hangar";
+import { hangarCatalog, hangarInfo } from "./render/hangarInfo";
+import { drawHangar, hangarRects } from "./ui/hangarScreen";
+import type { ModelEntry } from "./render/manifest";
+import type { RobotHandle } from "./render/robots";
 import { RelayClient, relayHttpUrl, relayUrl, wakeRelay } from "./net/relayClient";
 import { ChatController, type ChatRole } from "./chat/chatController";
 import { NexconnTransport } from "./chat/nexconnTransport";
@@ -44,10 +61,12 @@ import { openSquadInbox } from "./ui/squadInbox";
 import { rememberSquad, rememberUser } from "./chat/squadBook";
 import { HostSession } from "./net/hostSession";
 import { ClientSession } from "./net/clientSession";
-import type { ClientToHost, HostToClient, OverInfo } from "./net/gameProtocol";
+import type { ClientToHost, ForgeSrc, HostToClient, OverInfo } from "./net/gameProtocol";
 import { SPECTATOR_SLOT, type ErrorReason, type RelayToClient, type RosterEntry } from "./net/relayProtocol";
 
-type State = "loading" | "menu" | "lobby" | "playing" | "levelup" | "paused" | "gameover";
+type State = "loading" | "menu" | "select" | "lobby" | "playing" | "levelup" | "paused" | "gameover" | "hangar";
+/** App: where the robot-select screen leads once a robot is picked. */
+type SelectNext = "surface" | "orbit" | "host" | "join";
 type Mode = "solo" | "host" | "client" | "spectator";
 
 const BEST_KEY = "novaswarm.best";
@@ -60,17 +79,41 @@ const hudCanvas = document.getElementById("hud") as HTMLCanvasElement;
 const hudCtx = hudCanvas.getContext("2d")!;
 
 const audio = new Audio();
-const input = new Input(app);
+/** The Android app (nova-mobile) builds this same code with a native platform: touch-first UI. */
+const NATIVE = platform.native;
+const input = new Input(app, { dualSticks: NATIVE });
 
 let W = window.innerWidth;
 let H = window.innerHeight;
 
 const scene3d = new Scene3D(sceneCanvas);
+const hangar = new Hangar();
 const world = new World(audio);
 const followCamera = new FollowCamera(scene3d.camera);
 world.setViewRadius(followCamera.viewRadius);
+world.onHaptic = (kind) => platform.haptic(kind);
 
-const robotFactory = new RobotFactory();
+// App: step graphics down once if the frame rate stays low (phones vary a lot).
+const perfScaler = NATIVE ? new PerfScaler(2, (tier) => scene3d.setQualityTier(tier as 0 | 1 | 2)) : null;
+
+// App: safe-area insets (notch, rounded corners) from the env()-backed CSS vars. Zero on the website.
+const insets: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
+function readInsets(): void {
+  const cs = getComputedStyle(document.documentElement);
+  insets.top = parseFloat(cs.getPropertyValue("--safe-top")) || 0;
+  insets.right = parseFloat(cs.getPropertyValue("--safe-right")) || 0;
+  insets.bottom = parseFloat(cs.getPropertyValue("--safe-bottom")) || 0;
+  insets.left = parseFloat(cs.getPropertyValue("--safe-left")) || 0;
+}
+
+// App: robot classes and the unlocks earned across runs.
+let profile: Profile = loadProfile();
+let selectedArchetype: ArchetypeId = profile.unlocked.includes(profile.lastSelected) ? profile.lastSelected : "vanguard";
+let selectNext: SelectNext = "surface";
+let unlockToast: { archetype: Archetype; t: number } | null = null;
+const UNLOCK_TOAST_LIFE = 4;
+
+const models = new ModelLibrary();
 let worldView: WorldView | null = null;
 
 let state: State = "loading";
@@ -99,9 +142,89 @@ let lastChatUiT = 0;
 /** Spectators: the slot the camera follows. */
 let followSlot = 0;
 
+// Forge: a typed boss idea becomes a Lux3D model via the relay (which holds the key).
+const forge = new ForgeClient(RELAY_URL ? relayHttpUrl(RELAY_URL) : null);
+let forgeCount = 0;
+/** Title line while a pre-forged gallery boss stands in for live Forge. */
+let forgeNote: string | null = null;
+
+/** Where the current Forge model came from, so a co-op host can tell its clients. */
+let forgeSrc: ForgeSrc | null = null;
+
+function wearForge(role: string, name: string, src: ForgeSrc): void {
+  if (worldView) worldView.forgeRole = role;
+  world.forgeName = name;
+  forgeSrc = src;
+  hostSession?.setForge(src, name);
+}
+
+/** Co-op client: the host shared its Forge boss; load the same model. */
+function loadSharedForge(src: ForgeSrc, name: string): void {
+  const role = "url" in src ? `forge.boss.${++forgeCount}` : src.gallery;
+  const load = "url" in src ? models.loadRuntime(role, src.url, { prompt: name }) : models.loadLazy(src.gallery);
+  load
+    .then(() => {
+      if (worldView) worldView.forgeRole = role;
+      world.forgeName = name;
+    })
+    .catch((err) => console.error("[forge] shared model failed to load", err));
+}
+
+forge.onReady = (url, prompt) => {
+  const role = `forge.boss.${++forgeCount}`;
+  models
+    .loadRuntime(role, url, { prompt })
+    .then(() => {
+      forgeNote = null;
+      wearForge(role, prompt, { url });
+      showToast(`⚒ “${prompt}” is forged. It comes with the next boss.`);
+    })
+    .catch((err) => {
+      console.error("[forge] model failed to load", err);
+      useGallery(prompt, "load_failed");
+    });
+};
+forge.onFailed = (prompt, reason) => useGallery(prompt, reason);
+
+/**
+ * Live Forge can't run (offline, rate limit, daily cap, failure): summon the
+ * closest pre-forged Lux3D boss instead, and say so.
+ */
+function useGallery(idea: string, reason: string): void {
+  const pick = pickGalleryBoss(idea, models.gallery());
+  if (!pick) return;
+  forgeNote = "⚒ Summoning a pre-forged boss…";
+  models
+    .loadLazy(pick.role)
+    .then(() => {
+      wearForge(pick.role, pick.prompt, { gallery: pick.role });
+      const why = reason === "off" ? "Live Forge is offline" : "Live Forge is busy";
+      forgeNote = `⚒ ${why}. Pre-forged boss: “${pick.prompt}”`;
+      showToast(forgeNote);
+    })
+    .catch((err) => {
+      console.error("[forge] gallery model failed to load", err);
+      forgeNote = null;
+    });
+}
+
+const forgeAvailable = (): boolean => forge.state.kind !== "off" || models.gallery().length > 0;
+
 if (RELAY_URL) {
   void wakeRelay(RELAY_URL).then((ok) => {
     coop = ok ? "ready" : "unavailable";
+    if (ok) void forge.checkAvailable();
+  });
+}
+
+function startForge(): void {
+  forge.reset();
+  if (forge.busy) return;
+  void askForgePrompt().then((prompt) => {
+    if (!prompt) return;
+    forgeNote = null;
+    if (forge.state.kind === "off") useGallery(prompt, "off");
+    else void forge.start(prompt);
   });
 }
 
@@ -116,18 +239,42 @@ function resize(): void {
   hudCanvas.style.height = `${H}px`;
   hudCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
   scene3d.resize(W, H);
+  hangar.resize(W, H);
+  readInsets();
+  refreshReserved();
+}
+
+/** The HUD's ping button in screen space (the app draws the HUD inside the safe area). */
+function pingRect(): Rect {
+  const r = pingButtonRect(W - insets.left - insets.right, H - insets.top - insets.bottom);
+  return { x: r.x + insets.left, y: r.y + insets.top, w: r.w, h: r.h };
+}
+
+function dashRect(): Rect {
+  return dashButtonRect(W, H, insets, mode !== "solo");
+}
+
+/** App: tap-only areas that must never spawn a joystick. */
+function refreshReserved(): void {
+  if (!NATIVE) return;
+  const r = [pauseButtonRect(W, insets), dashRect()];
+  if (mode !== "solo") r.push(pingRect());
+  input.setReserved(r);
 }
 window.addEventListener("resize", resize);
 resize();
 
-robotFactory
-  .load(`${import.meta.env.BASE_URL}models/RobotExpressive.glb`, (f) => {
+models
+  .load(import.meta.env.BASE_URL, (f) => {
     loadFrac = f;
   })
   .then(() => {
-    worldView = new WorldView(scene3d.scene, robotFactory);
+    if (models.generatedRoles.length) console.info(`[models] Lux3D models: ${models.generatedRoles.join(", ")}`);
+    worldView = new WorldView(scene3d.scene, models);
     worldView.calibrateScale(PLAYER_MODEL_HEIGHT);
+    if (NATIVE) worldView.setPlayerTint(0, ARCHETYPES[selectedArchetype].color);
     state = "menu";
+    platform.ready();
     // Invite link: ?room=ABCD joins straight away (and the param is stripped
     // so a refresh doesn't re-join a room that has moved on).
     const params = new URLSearchParams(location.search);
@@ -144,6 +291,7 @@ robotFactory
   })
   .catch((err) => {
     console.error("Failed to load robot model:", err);
+    platform.ready();
   });
 
 // --- Persistence ------------------------------------------------------------
@@ -174,16 +322,50 @@ function enterRun(): void {
   audio.startMusic();
   newBest = false;
   state = "playing";
+  if (perfScaler) {
+    perfScaler.reset();
+    scene3d.setQualityTier(0);
+  }
+  refreshReserved();
   // Push a history entry so the mobile back button/gesture has something to
   // "consume" — without this, Android back navigates straight off the page
   // mid-run instead of pausing (see the popstate handler below).
   history.pushState({ novaGame: true }, "", location.href);
 }
 
-function startGame(): void {
+/** An orbit-shortcut run skips the whole surface half, so it must not set a best time. */
+let shortcutRun = false;
+
+function startGame(from: "surface" | "orbit" = "surface"): void {
   world.localSlot = 0;
   world.recordEffects = false;
-  world.reset();
+  if (NATIVE) {
+    world.reset([{ slot: 0, name: "YOU", archetype: selectedArchetype }]);
+    worldView?.setPlayerTint(0, ARCHETYPES[selectedArchetype].color);
+  } else world.reset();
+  shortcutRun = from === "orbit";
+  if (shortcutRun) {
+    // Start with the launch: the ground falls away, then the fleet arrives.
+    world.setPhase("launch");
+    showToast("Orbit shortcut: this run won't count toward your best time");
+  }
+  // Dev only: ?phase=launch|orbit jumps straight to space for testing and demo capture.
+  if (import.meta.env.DEV) {
+    const jump = new URLSearchParams(location.search).get("phase");
+    if (jump === "launch" || jump === "orbit") world.setPhase(jump);
+    // ?boss=now: the phase's boss spawns immediately (Forge testing, demo capture).
+    const q = new URLSearchParams(location.search);
+    // ?give=chain:3,lance:2,nova:2,orbital:3: start with these weapon levels (testing, demo capture).
+    for (const part of (q.get("give") ?? "").split(",")) {
+      const [name, lvl] = part.split(":");
+      if (name === "chain" || name === "lance" || name === "nova" || name === "orbital") world.player[name] = Math.max(0, Math.min(8, Number(lvl) || 1));
+    }
+    if (q.get("boss") === "now") {
+      const b = world.spawnEnemy(world.phase === "orbit" ? "capital" : "boss", world.player.x + 520, world.player.y - 120);
+      // &bridge=off: start the capital ship in stage two (bridge blown off).
+      if (q.get("bridge") === "off") b.enraged = true;
+    }
+  }
   enterRun();
 }
 
@@ -194,21 +376,52 @@ function openLevelUp(): void {
 
 function finishRun(): void {
   const s = world.stats;
-  if (!best || s.time > best.time) {
+  if (!shortcutRun && (!best || s.time > best.time)) {
     best = { ...s };
     saveBest(BEST_KEY, best);
     newBest = true;
   }
+  recordProgress(s.kills, s.time);
   state = "gameover";
+}
+
+/** App: fold a finished run into the profile; announce any robot it just unlocked. */
+function recordProgress(kills: number, seconds: number): void {
+  if (!NATIVE) return;
+  // An orbit-shortcut run skipped the surface, so its time can't unlock survival rewards.
+  const result = recordRunEnd(profile, kills, shortcutRun ? 0 : seconds);
+  profile = result.profile;
+  if (result.newlyUnlocked.length > 0) unlockToast = { archetype: result.newlyUnlocked[0], t: UNLOCK_TOAST_LIFE };
+}
+
+/** Title actions that start something: the app picks a robot first, the website goes straight in. */
+function beginSolo(from: "surface" | "orbit"): void {
+  if (NATIVE) {
+    selectNext = from;
+    state = "select";
+    return;
+  }
+  startGame(from);
+}
+
+function beginCoop(kind: "host" | "join"): void {
+  if (NATIVE) {
+    selectNext = kind;
+    state = "select";
+    return;
+  }
+  if (kind === "host") hostRoom();
+  else void askRoomCode().then((code) => code && joinRoom(code));
 }
 
 /** Abandon the current run and return to the title screen (still banks a new best). */
 function quitToMenu(): void {
   const s = world.stats;
-  if (!best || s.time > best.time) {
+  if (!shortcutRun && (!best || s.time > best.time)) {
     best = { ...s };
     saveBest(BEST_KEY, best);
   }
+  recordProgress(s.kills, s.time);
   audio.stopMusic();
   state = "menu";
 }
@@ -251,6 +464,9 @@ function hostRoom(): void {
     .then(() => {
       mode = "host";
       hostSession = new HostSession(world, relay!);
+      worldView?.setPlayerTint(0, null);
+      refreshReserved();
+      if (forgeSrc && world.forgeName) hostSession.setForge(forgeSrc, world.forgeName);
       state = "lobby";
       startChat("host", 0);
     })
@@ -276,6 +492,10 @@ function joinRoom(code: string): void {
     .then(({ slot }) => {
       mode = "client";
       clientSession = new ClientSession(world, relay!, slot);
+      clientSession.onForge = loadSharedForge;
+      if (NATIVE) clientSession.hello(selectedArchetype);
+      worldView?.setPlayerTint(0, null);
+      refreshReserved();
       state = "lobby";
       startChat("player", slot);
     })
@@ -302,6 +522,7 @@ function watchRoom(code: string): void {
     .then(() => {
       mode = "spectator";
       clientSession = new ClientSession(world, relay!, SPECTATOR_SLOT);
+      clientSession.onForge = loadSharedForge;
       world.spectating = true;
       followSlot = 0;
       state = "lobby";
@@ -429,6 +650,8 @@ function leaveCoop(reason?: string): void {
   world.localSlot = 0;
   world.recordEffects = false;
   world.reset();
+  if (NATIVE) worldView?.setPlayerTint(0, ARCHETYPES[selectedArchetype].color);
+  refreshReserved();
   audio.stopMusic();
   state = "menu";
   if (reason) showToast(reason);
@@ -469,7 +692,9 @@ function onHostMessage(m: HostToClient): void {
 
 function startCoopRun(): void {
   if (!hostSession || !relay) return;
-  const slots = roster.filter((p) => p.connected).map((p) => ({ slot: p.slot, name: p.name }));
+  const slots = roster
+    .filter((p) => p.connected)
+    .map((p) => ({ slot: p.slot, name: p.name, archetype: NATIVE && p.slot === 0 ? selectedArchetype : undefined }));
   if (slots.length < 2) return;
   relay.send({ t: "start" });
   hostSession.start(slots);
@@ -506,6 +731,57 @@ function copyInvite(): void {
 }
 
 // --- Per-state input handling (runs on the fixed update tick) ---------------
+// --- Hangar: browse every Lux3D model on a turntable ---------------------------
+let hangarItems: { role: string; entry: ModelEntry }[] = [];
+let hangarIndex = 0;
+let hangarLoading = false;
+const hangarHandles = new Map<string, RobotHandle>();
+
+function openHangar(): void {
+  const byRole = new Map(models.catalog().map((c) => [c.role, c]));
+  hangarItems = hangarCatalog([...byRole.keys()]).map((r) => byRole.get(r)!);
+  if (hangarItems.length === 0) {
+    showToast("No Lux3D models loaded");
+    return;
+  }
+  hangarIndex = 0;
+  state = "hangar";
+  hangar.resize(W, H);
+  void showHangarItem();
+}
+
+async function showHangarItem(): Promise<void> {
+  const item = hangarItems[hangarIndex];
+  hangarLoading = true;
+  if (!models.isGenerated(item.role)) hangar.clear(); // a lazy gallery boss still downloading
+  try {
+    await models.loadLazy(item.role).catch(() => undefined); // no-op unless it's a lazy gallery boss
+    let h = hangarHandles.get(item.role);
+    if (!h) hangarHandles.set(item.role, (h = models.create(item.role)));
+    if (hangarItems[hangarIndex] === item) hangar.show(h);
+  } finally {
+    if (hangarItems[hangarIndex] === item) hangarLoading = false;
+  }
+}
+
+function stepHangar(delta: number): void {
+  hangarIndex = (hangarIndex + delta + hangarItems.length) % hangarItems.length;
+  void showHangarItem();
+}
+
+function handleHangar(): void {
+  const click = input.consumeClick();
+  const r = hangarRects(W, H);
+  if (input.consumeKey("Escape") || input.consumeKey("Backspace") || (click && pointInRect(click.x, click.y, r.back))) {
+    input.consumeConfirm();
+    state = "menu";
+    return;
+  }
+  if (input.consumeKey("ArrowLeft") || input.consumeKey("KeyA") || (click && pointInRect(click.x, click.y, r.prev))) stepHangar(-1);
+  else if (input.consumeKey("ArrowRight") || input.consumeKey("KeyD") || (click && pointInRect(click.x, click.y, r.next))) stepHangar(1);
+  input.consumeConfirm();
+}
+
 function handleMenu(): void {
   if (inboxOpen) {
     input.consumeClick();
@@ -523,6 +799,50 @@ function handleMenu(): void {
     input.consumeConfirm();
     return;
   }
+  // The footer key hints are buttons too: Enter / O / H / F / M, by click or tap.
+  const footerHit = click ? titleFooterHit(W, H, click.x, click.y) : null;
+  if (footerHit) {
+    input.consumeConfirm();
+    audio.unlock();
+    if (footerHit === "mute") audio.toggleMute();
+    else if (footerHit === "orbit") beginSolo("orbit");
+    else if (footerHit === "hangar") openHangar();
+    else if (footerHit === "forge") {
+      if (forgeAvailable()) startForge();
+    } else if (!joining) beginSolo("surface");
+    return;
+  }
+  const panel = titlePanelHit(W, H);
+  if (click && panel && pointInRect(click.x, click.y, panel)) {
+    input.consumeConfirm(); // the info panel is look-only: tapping it must not start a run
+    return;
+  }
+  if (input.consumeKey("KeyO") || (click && pointInRect(click.x, click.y, titleButtonRects(W, H).orbit))) {
+    input.consumeConfirm();
+    audio.unlock();
+    beginSolo("orbit");
+    return;
+  }
+  if (input.consumeKey("KeyH")) {
+    input.consumeConfirm();
+    openHangar();
+    return;
+  }
+  if (input.consumeKey("KeyF") && forgeAvailable()) {
+    input.consumeConfirm();
+    startForge();
+    return;
+  }
+  if (click && pointInRect(click.x, click.y, titleButtonRects(W, H).hangar)) {
+    input.consumeConfirm();
+    openHangar();
+    return;
+  }
+  if (click && forgeAvailable() && pointInRect(click.x, click.y, titleButtonRects(W, H).forge)) {
+    input.consumeConfirm();
+    startForge();
+    return;
+  }
   if (click && coop !== "ready") {
     // The dimmed co-op row is a disabled control: tapping it must not start solo.
     const r = titleButtonRects(W, H);
@@ -535,12 +855,12 @@ function handleMenu(): void {
     const r = titleButtonRects(W, H);
     if (pointInRect(click.x, click.y, r.host)) {
       input.consumeConfirm();
-      hostRoom();
+      beginCoop("host");
       return;
     }
     if (pointInRect(click.x, click.y, r.join)) {
       input.consumeConfirm();
-      void askRoomCode().then((code) => code && joinRoom(code));
+      beginCoop("join");
       return;
     }
   }
@@ -548,7 +868,43 @@ function handleMenu(): void {
     input.consumeConfirm();
     return;
   }
-  if (input.consumeConfirm()) startGame();
+  if (input.consumeConfirm()) beginSolo("surface");
+}
+
+/** App: pick a robot (tap, or 1-4), then go where the title button pointed. */
+function handleSelect(): void {
+  if (input.consumeKey("KeyM")) audio.toggleMute();
+  const click = input.consumeClick();
+  if (input.consumeKey("Escape") || input.consumeKey("Backspace") || (click && pointInRect(click.x, click.y, archetypeBackRect()))) {
+    input.consumeConfirm();
+    state = "menu";
+    return;
+  }
+  let pick = -1;
+  const num = input.consumeNumber();
+  if (num >= 1 && num <= ARCHETYPE_LIST.length) pick = num - 1;
+  if (click) {
+    const rects = archetypeSelectLayout(W, H);
+    for (let i = 0; i < ARCHETYPE_LIST.length; i++) if (pointInRect(click.x, click.y, rects[i])) pick = i;
+  }
+  input.consumeConfirm(); // a stray confirm must not leak into the run
+  if (pick < 0) return;
+  const a = ARCHETYPE_LIST[pick];
+  if (!profile.unlocked.includes(a.id)) {
+    showToast("Locked: play more runs to unlock this robot", 2200);
+    return;
+  }
+  selectedArchetype = a.id;
+  profile = setLastSelected(profile, a.id);
+  worldView?.setPlayerTint(0, a.color);
+  audio.unlock();
+  if (selectNext === "surface" || selectNext === "orbit") {
+    startGame(selectNext);
+    return;
+  }
+  state = "menu";
+  if (selectNext === "host") hostRoom();
+  else void askRoomCode().then((code) => code && joinRoom(code));
 }
 
 function handleLobby(): void {
@@ -564,6 +920,20 @@ function handleLobby(): void {
 
 function handlePlaying(dt: number): void {
   if (input.consumeKey("KeyM")) audio.toggleMute();
+  if (NATIVE && mode !== "spectator") {
+    // On-screen buttons. Taps on them never become joysticks (see refreshReserved).
+    const click = input.consumeClick();
+    if (click && pointInRect(click.x, click.y, pauseButtonRect(W, insets))) {
+      state = "paused";
+      input.consumeConfirm();
+      return;
+    }
+    if (click && pointInRect(click.x, click.y, dashRect())) input.requestDash();
+    else if (click && mode !== "solo" && pointInRect(click.x, click.y, pingRect())) {
+      if (mode === "host") world.addPing(0);
+      else clientSession?.ping();
+    }
+  }
   if (input.consumeKey("Escape") || input.consumeKey("KeyP")) {
     state = "paused";
     input.consumeConfirm();
@@ -677,7 +1047,10 @@ function handlePaused(dt: number): void {
     input.consumeConfirm();
     if (click) {
       if (pointInRect(click.x, click.y, resumeButtonRect(W, H))) state = "playing";
-      else if (pointInRect(click.x, click.y, quitButtonRect(W, H))) leaveCoop();
+      else if (pointInRect(click.x, click.y, pauseMuteButtonRect(W, H))) {
+        audio.unlock();
+        audio.toggleMute();
+      } else if (pointInRect(click.x, click.y, quitButtonRect(W, H))) leaveCoop();
     }
     return;
   }
@@ -697,7 +1070,10 @@ function handlePaused(dt: number): void {
   if (click) {
     input.consumeConfirm();
     if (pointInRect(click.x, click.y, resumeButtonRect(W, H))) state = "playing";
-    else if (pointInRect(click.x, click.y, quitButtonRect(W, H))) quitToMenu();
+    else if (pointInRect(click.x, click.y, pauseMuteButtonRect(W, H))) {
+      audio.unlock();
+      audio.toggleMute();
+    } else if (pointInRect(click.x, click.y, quitButtonRect(W, H))) quitToMenu();
   }
 }
 
@@ -738,11 +1114,22 @@ window.addEventListener("popstate", () => {
   }
 });
 
+// App: the Android back button pauses a run, backs out of screens, and exits from the title.
+platform.onBack(() => {
+  if (state === "playing") state = "paused";
+  else if (state === "paused" && mode === "solo") state = "playing";
+  else if (state === "select" || state === "hangar") state = "menu";
+  else if (state === "lobby") leaveCoop();
+  else if (state === "menu") platform.exitApp();
+});
+
 // --- Loop -------------------------------------------------------------------
 function update(dt: number): void {
   switch (state) {
     case "loading": break;
     case "menu": handleMenu(); break;
+    case "select": handleSelect(); break;
+    case "hangar": handleHangar(); break;
     case "lobby": handleLobby(); break;
     case "playing": handlePlaying(dt); break;
     case "levelup": handleLevelUp(dt); break;
@@ -758,8 +1145,12 @@ function render(): void {
   const rdt = Math.min(0.05, (now - lastRenderT) / 1000);
   lastRenderT = now;
   const t = now / 1000;
+  // Only sample at gameplay load: menus are cheap and would hide real slowdowns.
+  if (state === "playing") perfScaler?.sample(rdt);
 
   hudCtx.clearRect(0, 0, W, H);
+  // Title screen only: set before the hangar/loading early returns below.
+  squadsButton.hidden = !(state === "menu" && coop === "ready" && !inboxOpen);
 
   if (state === "loading" || !worldView) {
     scene3d.render();
@@ -767,26 +1158,50 @@ function render(): void {
     return;
   }
 
+  if (state === "hangar") {
+    hangar.update(rdt);
+    hangar.render(scene3d.renderer);
+    const cur = hangarItems[hangarIndex];
+    drawHangar(hudCtx, W, H, t, hangarLoading || !cur ? null : hangarInfo(cur.role, cur.entry), hangarIndex, hangarItems.length, hangarLoading);
+    drawToast();
+    return;
+  }
+
   // A co-op client's World is written from host snapshots, once per frame.
   if (mode === "spectator") world.localSlot = followSlot;
-  squadsButton.hidden = !(state === "menu" && coop === "ready" && !inboxOpen);
   if ((mode === "client" || mode === "spectator") && clientSession?.isRunning) clientSession.frame(rdt);
   updateChatUi();
+  forge.tick();
   if (clientSession?.versionMismatch) leaveCoop("Your friend is on a different version — refresh or update the game");
 
   // Sync the 3D scene from World's data + advance camera/atmosphere on the
   // real render clock (not the fixed sim step) so animation blending stays smooth.
   worldView.sync(world, rdt);
-  followCamera.update(world, rdt);
+  followCamera.titleFraming = state === "menu" && W >= 720; // the close-up hero needs the wide layout's clear middle
+  followCamera.update(world, rdt, stepBossIntro());
   scene3d.followSun(world.player.x, world.player.y);
   scene3d.updateAtmosphere(rdt, world.player.x, world.player.y);
+  const blend = state === "menu" || state === "lobby" ? 0 : spaceBlend(world.phase, world.phaseT);
+  scene3d.setSpaceBlend(blend);
+  scene3d.updateZone(world.player.x, world.player.y, blend, t);
   scene3d.render();
 
   pushChatBubbles(worldView.floatLabels);
   drawFloatLabels(hudCtx, worldView.floatLabels, scene3d.camera, W, H);
 
   if (state === "menu") {
-    drawTitle(hudCtx, W, H, t, best, audio.muted, joining ? "waking" : coop);
+    drawTitle(
+      hudCtx, W, H, t, best, audio.muted, joining ? "waking" : coop,
+      forgeAvailable() ? { enabled: !forge.busy, status: forgeNote ?? forgeStatusLine(forge.state) } : null,
+      input.hoverPoint,
+      NATIVE,
+    );
+    drawUnlockToastIfAny(rdt);
+    drawToast();
+    return;
+  }
+  if (state === "select") {
+    drawArchetypeSelect(hudCtx, W, H, ARCHETYPE_LIST, profile, input.hoverPoint, selectedArchetype);
     drawToast();
     return;
   }
@@ -796,19 +1211,45 @@ function render(): void {
     return;
   }
 
-  drawHud(hudCtx, world, audio.muted, W, H, scene3d.camera);
+  // The app draws the HUD inside the safe area, so a notch never covers health or buttons.
+  hudCtx.save();
+  hudCtx.translate(insets.left, insets.top);
+  drawHud(hudCtx, world, audio.muted, W - insets.left - insets.right, H - insets.top - insets.bottom, scene3d.camera, { touch: NATIVE });
+  hudCtx.restore();
   drawScreenFlash(t);
+  if (NATIVE && state === "playing" && mode !== "spectator") {
+    drawTouchSticks(hudCtx, input.leftStick, input.rightStick);
+    drawPauseButton(hudCtx, pauseButtonRect(W, insets));
+    drawDashButton(hudCtx, dashRect(), world.player.dashCd);
+  }
+  if (state === "playing") drawPhaseCallout();
+  if (state === "playing") drawBossIntro();
+  if (state === "playing" && (forge.busy || forge.state.kind === "failed")) {
+    const line = forgeStatusLine(forge.state);
+    if (line) {
+      hudCtx.save();
+      hudCtx.textAlign = "center";
+      hudCtx.font = "600 13px 'Segoe UI', system-ui, sans-serif";
+      hudCtx.fillStyle = "rgba(255,210,150,0.85)";
+      hudCtx.fillText(line, W / 2, H - 18);
+      hudCtx.restore();
+    }
+  }
 
   const huddleNames = mode === "solo" ? [] : waitingNames();
   if (state === "levelup") {
-    drawLevelUp(hudCtx, W, H, currentCards(), input.pointerPosition, t, huddleNames);
+    drawLevelUp(hudCtx, W, H, currentCards(), input.hoverPoint ?? input.pointerPosition, t, huddleNames);
   } else if (state === "paused") {
-    if (mode === "solo") drawPause(hudCtx, W, H, t);
-    else drawCoopMenu(hudCtx, W, H, t);
+    if (mode === "solo") drawPause(hudCtx, W, H, t, audio.muted, !NATIVE);
+    else {
+      drawCoopMenu(hudCtx, W, H, t);
+      drawButton(hudCtx, pauseMuteButtonRect(W, H), audio.muted ? "SOUND: OFF" : "SOUND: ON", t, audio.muted ? "#ff3d6e" : "#8dff5a");
+    }
   } else if (state === "gameover") {
     const info = hostSession?.overInfo ?? clientSession?.overInfo;
     if (mode !== "solo" && info) drawCoopGameOver(hudCtx, W, H, t, info, mode === "host", coopBest, newBest);
     else drawGameOver(hudCtx, W, H, world.stats, best, newBest, t);
+    drawUnlockToastIfAny(rdt);
   } else if (state === "playing" && huddleNames.length > 0) {
     drawHuddleWait(hudCtx, W, H, huddleNames);
   }
@@ -818,6 +1259,94 @@ function render(): void {
   }
   if ((mode === "client" || mode === "spectator") && clientSession?.hostPaused && relay?.status === "open") drawBanner(hudCtx, W, "Host paused — waiting for the host's game…");
   drawToast();
+}
+
+// --- Boss intro: camera swoops to a newly arrived boss and its name fills the screen.
+// Detected from the (synced) enemies, so co-op clients and spectators get it too.
+let introT = -1;
+let introStart = 0;
+let introBoss: Enemy | null = null;
+let lastBoss: Enemy | null = null;
+
+/** Timed on the game clock, so it lines up with the sim's intro invulnerability. */
+function stepBossIntro(): { x: number; y: number; w: number } | undefined {
+  const boss = state === "playing" || state === "levelup" || state === "paused" ? world.enemies.find((e) => !e.dead && e.isBoss) ?? null : null;
+  if (boss && boss !== lastBoss && boss.spawnT < 1.5) {
+    introBoss = boss;
+    introStart = world.time - boss.spawnT;
+  }
+  lastBoss = boss;
+  if (!introBoss) return undefined;
+  introT = world.time - introStart;
+  if (introT >= INTRO_SECONDS || introBoss.dead) {
+    introT = -1;
+    introBoss = null;
+    return undefined;
+  }
+  return { x: introBoss.x, y: introBoss.y, w: introWeight(introT) };
+}
+
+function drawBossIntro(): void {
+  if (introT < 0 || !introBoss) return;
+  const a = Math.min(1, introWeight(introT) * 1.4);
+  if (a <= 0.01) return;
+  const ctx = hudCtx;
+  const name = world.bossLabel;
+  const sub = introBoss.forged ? "Forged with Aholo Lux3D" : introBoss.kind === "capital" ? "Flagship of the swarm" : "Guardian of the surface";
+  ctx.save();
+  ctx.globalAlpha = a;
+  // Letterbox bars for the cinematic beat.
+  ctx.fillStyle = "rgba(0,0,0,0.75)";
+  const bar = H * 0.09 * a;
+  ctx.fillRect(0, 0, W, bar);
+  ctx.fillRect(0, H - bar, W, bar);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const size = Math.min(64, (W * 0.9) / Math.max(8, name.length * 0.62));
+  ctx.font = `900 ${size}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.shadowColor = introBoss.forged ? "#ffb44d" : "#ff5a5a";
+  ctx.shadowBlur = 28;
+  ctx.fillStyle = "#fff4e0";
+  ctx.fillText(name, W / 2, H * 0.72);
+  ctx.shadowBlur = 0;
+  ctx.font = `700 ${Math.max(14, size * 0.3)}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.fillStyle = introBoss.forged ? "rgba(255,200,130,0.95)" : "rgba(230,244,255,0.8)";
+  ctx.fillText(sub.toUpperCase(), W / 2, H * 0.72 + size * 0.8);
+  ctx.restore();
+}
+
+function drawPhaseCallout(): void {
+  const c = phaseCallout(world.phase, world.phaseT, world.loop);
+  if (!c) return;
+  const ctx = hudCtx;
+  ctx.save();
+  ctx.globalAlpha = c.alpha;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const size = Math.min(72, W / 9);
+  ctx.font = `900 ${size}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.shadowColor = world.phase === "descent" ? "#ff9a5a" : "#4fb4ff";
+  ctx.shadowBlur = 24;
+  ctx.fillStyle = "#eafcff";
+  ctx.fillText(c.title, W / 2, H * 0.26);
+  ctx.shadowBlur = 0;
+  ctx.font = `600 ${Math.max(14, size * 0.28)}px 'Segoe UI', system-ui, sans-serif`;
+  ctx.fillStyle = "rgba(230,244,255,0.8)";
+  ctx.fillText(c.sub, W / 2, H * 0.26 + size * 0.75);
+  ctx.restore();
+}
+
+/** App: fade the "new robot unlocked" banner in and out over its lifetime. */
+function drawUnlockToastIfAny(rdt: number): void {
+  if (!unlockToast) return;
+  unlockToast.t -= rdt;
+  if (unlockToast.t <= 0) {
+    unlockToast = null;
+    return;
+  }
+  const elapsed = UNLOCK_TOAST_LIFE - unlockToast.t;
+  const alpha = elapsed < 0.3 ? elapsed / 0.3 : unlockToast.t < 0.6 ? unlockToast.t / 0.6 : 1;
+  drawUnlockToast(hudCtx, W, H, unlockToast.archetype, Math.max(0, Math.min(1, alpha)));
 }
 
 function drawToast(): void {
@@ -897,6 +1426,15 @@ if (new URLSearchParams(location.search).has("debug")) {
     px: Math.round(world.player.x),
     py: Math.round(world.player.y),
     liveBullets: world.bullets.reduce((n, b) => n + (b.dead ? 0 : 1), 0),
-    ui: { title: titleButtonRects(W, H), lobby: lobbyButtonRects(W, H), coopOver: coopGameOverRects(W, H) },
+    ui: { title: titleButtonRects(W, H), lobby: lobbyButtonRects(W, H), coopOver: coopGameOverRects(W, H), select: archetypeSelectLayout(W, H) },
+    native: NATIVE,
+    selectedArchetype,
+    unlocked: profile.unlocked,
+    pauseRect: pauseButtonRect(W, insets),
+    dashRect: dashRect(),
+    dashCd: +world.player.dashCd.toFixed(2),
+    leftStick: input.leftStick.active,
+    rightStick: input.rightStick.active,
+    phase: world.phase,
   });
 }

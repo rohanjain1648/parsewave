@@ -27,9 +27,39 @@ export const PALETTE = {
   enemyBullet: "#ff5a5a",
   text: "#eaf6ff",
   danger: "#ff3d6e",
+  chain: "#b48cff",
+  lance: "#ffcf5a",
 } as const;
 
-export type EnemyKind = "grunt" | "fast" | "tank" | "splitter" | "shooter" | "boss";
+export type LandKind = "grunt" | "fast" | "tank" | "splitter" | "shooter";
+export type SpaceKind = "interceptor" | "bomber" | "kamikaze" | "asteroid";
+export type EnemyKind = LandKind | SpaceKind | "boss" | "capital";
+
+/** Run structure: surface -> (land boss dies) launch -> orbit -> (capital dies) descent -> surface, looping. */
+export type Phase = "surface" | "launch" | "orbit" | "descent";
+
+export const PHASES = {
+  launchSeconds: 4,
+  descentSeconds: 3,
+  /** Seconds of orbit before the capital ship warps in. */
+  orbitBossDelay: 40,
+  /** Orbit enemies start at this many seconds' worth of surface strength, then climb with time in orbit. */
+  orbitStartDifficulty: 75,
+  /** Each completed loop multiplies enemy HP by this. */
+  loopHpMul: 1.35,
+};
+
+/** Length of the boss-arrival camera intro; players can't be hurt while it plays. */
+export const BOSS_INTRO_SECONDS = 2.6;
+
+/** Ship handling in orbit: thrust and inertia instead of instant steering. */
+export const SPACE = {
+  thrust: 820,
+  /** Fraction of velocity lost per second with no thrust (low = long drift). */
+  drag: 1.4,
+  /** Top speed relative to the robot's ground speed. */
+  speedMul: 1.6,
+};
 
 /** Which RobotExpressive.glb clip an enemy tier walks/idles with. */
 export type RobotAnim = "Walking" | "Running" | "Idle";
@@ -51,11 +81,12 @@ export interface EnemyDef {
   unlockAt: number;
   /** Relative spawn weight once unlocked. */
   weight: number;
-  shooter?: { range: number; cooldown: number; bulletSpeed: number; bulletDmg: number };
+  /** volley: bullets per shot, fanned (bosses only; default 1 for regular shooters). */
+  shooter?: { range: number; cooldown: number; bulletSpeed: number; bulletDmg: number; volley?: number };
   splitInto?: EnemyKind;
 }
 
-export const ENEMIES: Record<Exclude<EnemyKind, "boss">, EnemyDef> = {
+export const ENEMIES: Record<LandKind, EnemyDef> = {
   grunt: {
     kind: "grunt",
     color: "#ff3d9a",
@@ -137,14 +168,106 @@ export const BOSS: EnemyDef = {
   modelScale: 3.2,
   anim: "Walking",
   animSpeed: 0.5,
-  baseHp: 900,
+  baseHp: 700,
   baseSpeed: 46,
   touchDamage: 26,
   xp: 250,
   unlockAt: 0,
   weight: 0,
-  shooter: { range: 900, cooldown: 1.4, bulletSpeed: 200, bulletDmg: 14 },
+  shooter: { range: 900, cooldown: 2.0, bulletSpeed: 200, bulletDmg: 11, volley: 3 },
 };
+
+/**
+ * Orbit roster. unlockAt is seconds into the current orbit, not run time.
+ * Ships and rocks are rigid models, so `anim` only drives procedural motion.
+ */
+export const SPACE_ENEMIES: Record<SpaceKind, EnemyDef> = {
+  interceptor: {
+    kind: "interceptor",
+    color: "#ff4fd8",
+    radius: 16,
+    modelScale: 1,
+    anim: "Running",
+    animSpeed: 1,
+    baseHp: 12,
+    baseSpeed: 150,
+    touchDamage: 8,
+    xp: 4,
+    unlockAt: 0,
+    weight: 10,
+    shooter: { range: 420, cooldown: 2.6, bulletSpeed: 320, bulletDmg: 8 },
+  },
+  kamikaze: {
+    kind: "kamikaze",
+    color: "#ff8a2b",
+    radius: 13,
+    modelScale: 0.8,
+    anim: "Running",
+    animSpeed: 1.4,
+    baseHp: 5,
+    baseSpeed: 230,
+    touchDamage: 18,
+    xp: 3,
+    unlockAt: 6,
+    weight: 6,
+  },
+  bomber: {
+    kind: "bomber",
+    color: "#9d7bff",
+    radius: 28,
+    modelScale: 1.8,
+    anim: "Walking",
+    animSpeed: 0.6,
+    baseHp: 70,
+    baseSpeed: 48,
+    touchDamage: 16,
+    xp: 12,
+    unlockAt: 12,
+    weight: 3,
+    shooter: { range: 640, cooldown: 2.4, bulletSpeed: 200, bulletDmg: 12 },
+  },
+  asteroid: {
+    kind: "asteroid",
+    color: "#9aa4b8",
+    radius: 30,
+    modelScale: 1.6,
+    anim: "Idle",
+    animSpeed: 1,
+    baseHp: 30,
+    baseSpeed: 55,
+    touchDamage: 14,
+    xp: 6,
+    unlockAt: 0,
+    weight: 4,
+  },
+};
+
+export const SPACE_KINDS = Object.keys(SPACE_ENEMIES) as SpaceKind[];
+
+export const CAPITAL: EnemyDef = {
+  kind: "capital",
+  color: "#ffb44d",
+  radius: 90,
+  modelScale: 4.2,
+  anim: "Idle",
+  animSpeed: 0.4,
+  baseHp: 1500,
+  baseSpeed: 30,
+  touchDamage: 30,
+  xp: 400,
+  unlockAt: 0,
+  weight: 0,
+  shooter: { range: 1100, cooldown: 1.7, bulletSpeed: 230, bulletDmg: 11, volley: 3 },
+};
+
+/** Stats for any enemy kind. */
+export const defFor = (kind: EnemyKind): EnemyDef => {
+  if (kind === "boss") return BOSS;
+  if (kind === "capital") return CAPITAL;
+  return (ENEMIES as Record<string, EnemyDef>)[kind] ?? SPACE_ENEMIES[kind as SpaceKind];
+};
+
+export const isBossKind = (kind: EnemyKind): boolean => kind === "boss" || kind === "capital";
 
 export const DIRECTOR = {
   /** Seconds between the escalating "phase" bumps. */
@@ -157,6 +280,8 @@ export const DIRECTOR = {
   batchBase: 1,
   batchGrowthSeconds: 140, // batch size grows by 1 every this many seconds (half growth rate)
   bossEverySeconds: 120,
+  /** Boss HP is x(1 + runTime / this). */
+  bossHpScaleSeconds: 360,
   // Each enemy is now a skinned, animated GLB robot rather than a flat neon
   // polygon — capped lower than the 2D build so hundreds of simultaneous
   // skeleton updates don't tank the frame rate. Fewer, denser robots still
@@ -171,6 +296,8 @@ export const PLAYER = {
   basePickupRadius: 130,
   iFrames: 0.7, // invulnerability after a hit
   baseRegen: 0, // hp/sec, raised by upgrades
+  /** Dash (Shift / E): a short invulnerable burst along your heading. */
+  dash: { seconds: 0.15, speed: 1000, cooldown: 2.4 },
 };
 
 /** Co-op tuning. Every multiplier is written so a 1-player squad gets exactly 1. */
