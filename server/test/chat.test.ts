@@ -122,7 +122,8 @@ class FakeBackend implements ChatBackend {
   }
 }
 
-const flush = () => new Promise((r) => setTimeout(r, 0));
+/** Let the relay finish its async chat setup (several promise hops). */
+const flush = () => new Promise((r) => setTimeout(r, 20));
 let rm: RoomManager;
 let chat: FakeBackend;
 const send = (c: Conn, m: unknown) => rm.onText(c, JSON.stringify(m));
