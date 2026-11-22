@@ -264,9 +264,11 @@ export class RoomManager {
       this.send(fan, { t: "closed", reason: "host_left" });
       fan.close();
     }
-    if (this.chat && (room.squadReady || room.watchReady)) {
+    // The squad's group channel outlives the room on purpose: players find it
+    // again in the Squads inbox and keep talking. Only the crowd channel goes.
+    if (this.chat && room.watchReady) {
       this.chat
-        .closeChannels(room.squadReady ? room.squadId : null, room.watchReady ? room.watchId : null)
+        .closeChannels(null, room.watchId)
         .catch(() => {
           // Best effort: Nexconn also destroys idle open channels by itself.
         });

@@ -1,4 +1,5 @@
 import { CUSTOM_TYPES, type ChatTarget, type ChatTransport, type IncomingChat } from "./chatController";
+import { rememberUser, squadName, userName } from "./squadBook";
 
 /**
  * The Nexconn Web SDK behind ChatTransport. The SDK is loaded on first use, so
@@ -13,13 +14,28 @@ interface ChatSession {
 }
 
 type Sdk = typeof import("@nexconn/chat");
+type ChatUiApp = import("@nexconn/chatui").NCChatUIApplication;
 
-let sdkReady: Promise<Sdk> | null = null;
+let sdkReady: Promise<{ sdk: Sdk; ui: ChatUiApp | null }> | null = null;
 let active: NexconnTransport | null = null;
 
-function loadSdk(appKey: string): Promise<Sdk> {
-  sdkReady ??= import("@nexconn/chat").then((sdk) => {
+/**
+ * Load the Chat SDK and Nexconn's Chat UI (the Squads inbox) together: the UI
+ * must be set up between the engine's initialize and connect.
+ */
+function loadSdk(appKey: string): Promise<{ sdk: Sdk; ui: ChatUiApp | null }> {
+  sdkReady ??= Promise.all([import("@nexconn/chat"), import("@nexconn/chatui")]).then(([sdk, chatui]) => {
     sdk.NCEngine.initialize({ appKey, areaCode: sdk.AreaCode.SG });
+    const ui = chatui.NCChatUIApplication.initialize({
+      language: "en_US",
+      hooks: {
+        reqUserProfiles: async (ids) => ids.map((userId) => ({ userId, name: userName(userId) })),
+        reqGroupProfiles: async (ids) => ids.map((groupId) => ({ groupId, name: squadName(groupId), memberCount: 0 })),
+        reqSystemProfiles: async () => [],
+        reqGroupMembers: async () => [],
+      },
+    });
+    ui?.ready();
     sdk.NCEngine.registerCustomMessages(
       CUSTOM_TYPES.map((messageType) => ({ messageType, isPersisted: false, isCounted: false })),
     );
@@ -31,9 +47,34 @@ function loadSdk(appKey: string): Promise<Sdk> {
         },
       }),
     );
-    return sdk;
+    return { sdk, ui };
   });
   return sdkReady;
+}
+
+let connected: Promise<{ sdk: Sdk; ui: ChatUiApp | null; userId: string }> | null = null;
+
+/**
+ * One Nexconn connection per page, shared by in-game chat and the Squads
+ * inbox, so this browser keeps one chat identity and its squad history.
+ */
+export function connectChat(relayHttp: string): Promise<{ sdk: Sdk; ui: ChatUiApp | null; userId: string }> {
+  connected ??= (async () => {
+    let session = await loadSession(relayHttp, false);
+    const { sdk, ui } = await loadSdk(session.appKey);
+    let res = await sdk.NCEngine.connect({ token: session.token });
+    if (res.code !== 0) {
+      // A saved token can go stale (for example if the App Secret was rotated).
+      session = await loadSession(relayHttp, true);
+      res = await sdk.NCEngine.connect({ token: session.token });
+      if (res.code !== 0) throw new Error(`chat connect failed: code ${res.code}`);
+    }
+    return { sdk, ui, userId: session.userId };
+  })().catch((e) => {
+    connected = null;
+    throw e;
+  });
+  return connected;
 }
 
 // ---- Identity ------------------------------------------------------------------
@@ -96,16 +137,9 @@ export class NexconnTransport implements ChatTransport {
 
   async connect(): Promise<{ userId: string }> {
     active = this;
-    let session = await loadSession(this.relayHttp, false);
-    this.sdk = await loadSdk(session.appKey);
-    let res = await this.sdk.NCEngine.connect({ token: session.token });
-    if (res.code !== 0) {
-      // A saved token can go stale (for example if the App Secret was rotated).
-      session = await loadSession(this.relayHttp, true);
-      res = await this.sdk.NCEngine.connect({ token: session.token });
-      if (res.code !== 0) throw new Error(`chat connect failed: code ${res.code}`);
-    }
-    return { userId: session.userId };
+    const { sdk, userId } = await connectChat(this.relayHttp);
+    this.sdk = sdk;
+    return { userId };
   }
 
   async joinSquad(channelId: string): Promise<void> {
@@ -134,8 +168,8 @@ export class NexconnTransport implements ChatTransport {
 
   async stop(): Promise<void> {
     if (active === this) active = null;
-    // Disconnecting also leaves the crowd channel.
-    if (this.sdk) await this.sdk.NCEngine.disconnect();
+    // Stay connected (the Squads inbox uses the same connection); just leave the crowd.
+    if (this.sdk && this.watchId) await new this.sdk.OpenChannel(this.watchId).exitChannel();
   }
 
   /** Called by the shared SDK handler. */
@@ -153,6 +187,7 @@ export class NexconnTransport implements ChatTransport {
       this.onMessage({ ...base, type: msg.messageType, payload: msg.content });
     } else if (typeof msg.content.text === "string") {
       const info = msg.content.senderUserInfo as { name?: string; extra?: string } | undefined;
+      if (info?.name) rememberUser(msg.senderUserId, info.name);
       this.onMessage({
         ...base,
         type: "text",

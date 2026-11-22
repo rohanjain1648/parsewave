@@ -40,6 +40,8 @@ import { ChatController, type ChatRole } from "./chat/chatController";
 import { NexconnTransport } from "./chat/nexconnTransport";
 import { quickOptions, type QuickLine } from "./chat/quickChat";
 import { ChatPanel, type ChatPanelMode } from "./ui/chatPanel";
+import { openSquadInbox } from "./ui/squadInbox";
+import { rememberSquad, rememberUser } from "./chat/squadBook";
 import { HostSession } from "./net/hostSession";
 import { ClientSession } from "./net/clientSession";
 import type { ClientToHost, HostToClient, OverInfo } from "./net/gameProtocol";
@@ -333,7 +335,10 @@ function startChat(role: ChatRole, slot: number): void {
     const label = choice === "surge" ? "SWARM SURGE" : "SUPPLY DROP";
     showToast(`The crowd chose ${label}! (${Math.max(supply, surge)}–${Math.min(supply, surge)})`, 4000);
   };
-  void c.start((userId) => relay?.send({ t: "chatJoin", userId }));
+  void c.start((userId) => {
+    rememberUser(userId, callsign);
+    relay?.send({ t: "chatJoin", userId });
+  });
 }
 
 function stopChat(): void {
@@ -349,6 +354,23 @@ function sendQuickAt(index: number): void {
   const line = quickLines[index];
   if (line) chat?.sendQuick(line);
 }
+
+// --- Squads inbox (Nexconn Chat UI), opened from the title screen ---
+const squadsButton = document.createElement("button");
+squadsButton.type = "button";
+squadsButton.className = "squads-button";
+squadsButton.textContent = "💬 Squads";
+squadsButton.hidden = true;
+let inboxOpen = false;
+squadsButton.addEventListener("pointerdown", (e) => e.stopPropagation());
+squadsButton.addEventListener("click", () => {
+  if (!RELAY_URL || inboxOpen) return;
+  inboxOpen = true;
+  void openSquadInbox(relayHttpUrl(RELAY_URL), () => {
+    inboxOpen = false;
+  });
+});
+document.body.append(squadsButton);
 
 /** Show the panel that fits this moment, a few times a second. */
 function updateChatUi(): void {
@@ -423,6 +445,7 @@ function onRelayMessage(m: RelayToClient): void {
       onHostMessage({ k: "start", slots: m.players.map((p) => ({ slot: p.slot, name: p.name })) });
     }
   } else if (m.t === "chat") {
+    if (m.squadId) rememberSquad(m.squadId, roster.map((p) => p.name));
     void chat?.onChannels(m);
   } else if (m.t === "chatOff") {
     chat?.onChatOff();
@@ -484,6 +507,11 @@ function copyInvite(): void {
 
 // --- Per-state input handling (runs on the fixed update tick) ---------------
 function handleMenu(): void {
+  if (inboxOpen) {
+    input.consumeClick();
+    input.consumeConfirm();
+    return;
+  }
   if (input.consumeKey("KeyM")) {
     audio.unlock();
     audio.toggleMute();
@@ -741,6 +769,7 @@ function render(): void {
 
   // A co-op client's World is written from host snapshots, once per frame.
   if (mode === "spectator") world.localSlot = followSlot;
+  squadsButton.hidden = !(state === "menu" && coop === "ready" && !inboxOpen);
   if ((mode === "client" || mode === "spectator") && clientSession?.isRunning) clientSession.frame(rdt);
   updateChatUi();
   if (clientSession?.versionMismatch) leaveCoop("Your friend is on a different version — refresh or update the game");

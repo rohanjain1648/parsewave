@@ -354,3 +354,83 @@ body::after {
   padding: 8px 10px;
   background: rgba(8, 10, 20, 0.8);
 }
+
+/* ---- Squads inbox (Nexconn Chat UI) ---- */
+.squads-button {
+  position: fixed;
+  z-index: 5;
+  top: 16px;
+  left: 16px;
+  font: 800 15px "Segoe UI", system-ui, sans-serif;
+  color: #eafcff;
+  padding: 10px 14px;
+  border: 1.5px solid #5dffb0;
+  border-radius: 12px;
+  background: rgba(8, 10, 20, 0.8);
+  cursor: pointer;
+}
+
+.squads-button[hidden] {
+  display: none;
+}
+
+.squad-inbox {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  background: rgba(3, 4, 8, 0.92);
+  color: #eafcff;
+  touch-action: auto;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.squad-inbox-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.squad-inbox-head strong {
+  color: #3fe9ff;
+  letter-spacing: 0.08em;
+}
+
+.squad-inbox-head span {
+  color: rgba(230, 244, 255, 0.7);
+  font-size: 14px;
+}
+
+.squad-inbox-close {
+  margin-left: auto;
+  font: 800 14px "Segoe UI", system-ui, sans-serif;
+  color: #eafcff;
+  padding: 8px 14px;
+  border: 1px solid rgba(230, 244, 255, 0.4);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+}
+
+.squad-inbox-body {
+  flex: 1;
+  min-height: 0;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fff;
+  color: #111;
+}
+
+.squad-inbox-body nc-chat-ui-app-provider {
+  display: block;
+  height: 100%;
+}
+
+.squad-inbox-status {
+  padding: 24px;
+}

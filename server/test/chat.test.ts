@@ -197,14 +197,14 @@ test("with no chat backend configured, chatJoin answers chatOff", async () => {
   expect(host.last("chatOff")).toBeTruthy();
 });
 
-test("closing a room dismisses its channels", async () => {
+test("closing a room clears its crowd channel but keeps the squad, so the squad can keep chatting", async () => {
   const { host } = hostRoom();
   send(host, { t: "chatJoin", userId: "h1" });
   await flush();
   await flush();
   const ids = host.last("chat")!;
   rm.onClose(host);
-  expect(chat.log).toContain(`close ${ids.squadId} ${ids.watchId}`);
+  expect(chat.log).toContain(`close null ${ids.watchId}`);
 });
 
 test("a spectator takes no player slot, can join a started run, and gets snapshots", () => {
