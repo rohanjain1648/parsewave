@@ -55,12 +55,14 @@ const nova = (page) => page.evaluate(() => window.__nova());
 async function waitFor(page, pred, what, timeout = 30_000) {
   const end = Date.now() + timeout;
   let last;
+  const toasts = new Set();
   while (Date.now() < end) {
     last = await nova(page).catch(() => undefined);
+    if (last?.toast) toasts.add(last.toast);
     if (last && pred(last)) return last;
     await page.waitForTimeout(200);
   }
-  throw new Error(`timed out waiting for ${what} (last: ${JSON.stringify({ state: last?.state, chat: last?.chat, feed: last?.chatFeed })})`);
+  throw new Error(`timed out waiting for ${what} (last: ${JSON.stringify({ state: last?.state, mode: last?.mode, chat: last?.chat, toast: last?.toast, relay: last?.relay, feed: last?.chatFeed, toasts: [...toasts] })})`);
 }
 const center = (r) => [r.x + r.w / 2, r.y + r.h / 2];
 const shot = async (page, name) => {
@@ -87,6 +89,7 @@ try {
     const page = await ctx.newPage();
     page.on("pageerror", (e) => errors.push(`${label} pageerror: ${e.message}`));
     page.on("console", (m) => {
+      if (m.type() === "warning" && /chat/i.test(m.text())) console.log(`[${label} warn] ${m.text()}`);
       if (m.type() === "error") errors.push(`${label} console: ${m.text()}`);
     });
     await page.goto(url + path, { waitUntil: "load", timeout: 60_000 });
@@ -114,6 +117,26 @@ try {
   await a.mouse.click(...center(lobby.ui.lobby.start));
   await waitFor(a, (s) => s.state === "playing", "host playing");
   await waitFor(b, (s) => s.state === "playing", "joiner playing");
+  // Keep both robots firing and dodging for the rest of the test, picking cards when offered.
+  let fighting = true;
+  const fight = (async () => {
+    const dirs = new Map([[a, "d"], [b, "a"]]);
+    for (const [p, d] of dirs) {
+      await p.mouse.move(900, 400);
+      await p.mouse.down();
+      await p.keyboard.down(d);
+    }
+    while (fighting) {
+      await a.waitForTimeout(2500);
+      for (const [p, d] of dirs) {
+        await p.keyboard.up(d);
+        const next = d === "d" ? "a" : "d";
+        dirs.set(p, next);
+        await p.keyboard.down(next);
+        if ((await nova(p)).state === "levelup") await p.keyboard.press("Digit1");
+      }
+    }
+  })().catch(() => {});
   const c = await open("spectator", `?debug&watch=${lobby.code}`);
   await waitFor(c, (s) => s.state === "playing" && s.mode === "spectator", "spectator watching", 90_000);
   await waitFor(c, (s) => s.chat === "ready", "spectator chat ready", 60_000);
@@ -140,10 +163,15 @@ try {
   await shot(c, "4-crowd-vote");
   await c.click(".chat-vote button:nth-of-type(2)");
   const before = (await nova(a)).liveEnemies;
-  await a.waitForFunction(() => (window.__nova().toast ?? "").includes("crowd chose"), null, { timeout: 25_000 });
+  await a.waitForFunction(() => (window.__nova().toast ?? "").includes("crowd chose"), null, { timeout: 25_000 }).catch(async () => {
+    const s = await nova(a);
+    throw new Error(`host never showed the crowd result (host state=${s.state}, toast=${s.toast})`);
+  });
   const after = (await nova(a)).liveEnemies;
   await shot(a, "5-crowd-result");
   console.log(`OK: crowd vote applied by the host (enemies ${before} -> ${after})`);
+  fighting = false;
+  await fight;
 } catch (e) {
   console.error("CHAT SMOKE FAIL:", e.message);
   exitCode = 1;

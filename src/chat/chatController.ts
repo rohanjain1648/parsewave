@@ -153,6 +153,14 @@ export class ChatController {
     return b && this.now() < b.until ? b.text : null;
   }
 
+  /** Backup for a lost result message. Generous, because the host times votes in game time, which runs slow on a lagging host. */
+  expireVote(): void {
+    if (this.vote && this.now() > this.vote.endsAt + 20_000) {
+      this.vote = null;
+      this.onChange();
+    }
+  }
+
   /** Spectators only, once per round. */
   castVote(choice: CrowdChoice): void {
     if (this.me.role !== "spectator" || !this.vote || this.vote.mine) return;
@@ -165,9 +173,9 @@ export class ChatController {
    * Host, once per game tick: run the crowd vote. Returns the winning choice
    * on the tick a vote closes, for the caller to apply to the World.
    */
-  hostTick(dt: number, canRun: boolean): CrowdChoice | null {
+  hostTick(dt: number, canRun: boolean, runEnded = false): CrowdChoice | null {
     if (this.me.role !== "host" || this.status !== "ready" || !this.hasWatch) return null;
-    const ev = this.hostVote.tick(dt, canRun);
+    const ev = this.hostVote.tick(dt, canRun, runEnded);
     if (!ev) return null;
     if (ev.kind === "open") {
       this.fire(this.transport.sendCustom("watch", "nova:vote_open", { round: ev.round, seconds: ev.seconds }));

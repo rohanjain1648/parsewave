@@ -286,3 +286,24 @@ test("players can't vote, and a vote from a player's client isn't sent", async (
   c.castVote("surge");
   expect(t.sent.filter((s) => s.type === "nova:vote")).toHaveLength(0);
 });
+
+test("a vote still open when the run ends is closed with no winner", () => {
+  const v = new CrowdVoteHost();
+  toOpen(v);
+  v.cast("a", 1, "surge");
+  expect(v.tick(0.5, false, true)).toEqual({ kind: "result", round: 1, choice: null, supply: 0, surge: 1 });
+  expect(v.tick(0.5, false, true)).toBeNull();
+});
+
+test("a spectator's vote card clears itself if the result never arrives", async () => {
+  const c = make("spectator");
+  await c.start(() => {});
+  await c.onChannels({ squadId: null, watchId: "w", hostUserId: "host1" });
+  t.onMessage(custom("host1", "nova:vote_open", { round: 1, seconds: 10 }));
+  now += 9_000;
+  c.expireVote();
+  expect(c.vote).not.toBeNull();
+  now += 22_000;
+  c.expireVote();
+  expect(c.vote).toBeNull();
+});

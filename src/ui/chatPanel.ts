@@ -124,6 +124,7 @@ export class ChatPanel {
 
   /** Run a few times a second: the vote countdown. */
   tick(): void {
+    this.chat.expireVote();
     const v = this.chat.vote;
     if (!v || this.role !== "spectator") {
       if (this.voteBox.childElementCount) this.voteBox.replaceChildren();

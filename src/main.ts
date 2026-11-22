@@ -572,7 +572,7 @@ function stepCoop(dt: number, inp: PlayerInput): void {
   }
   if (mode === "host" && hostSession) {
     hostSession.step(dt, inp);
-    const crowd = chat?.hostTick(dt, spectators > 0 && !hostSession.huddle && !world.gameOver);
+    const crowd = chat?.hostTick(dt, spectators > 0 && !hostSession.huddle && !world.gameOver, world.gameOver);
     if (crowd === "supply") world.crowdSupplyDrop();
     else if (crowd === "surge") world.crowdSurge();
     if (hostSession.overInfo && state !== "gameover") finishCoopRun(hostSession.overInfo);
