@@ -22,8 +22,10 @@
     "vitest": "^2.1.9"
   },
   "dependencies": {
-    "@nexconn/chat": "^26.2.1",
-    "@nexconn/engine": "^26.2.1",
+    "@nexconn/chat": "~26.5.0",
+    "@nexconn/chatui": "^26.5.0",
+    "@nexconn/engine": "~26.5.0",
+    "lit": "^3.3.3",
     "three": "^0.185.1"
   }
 }
