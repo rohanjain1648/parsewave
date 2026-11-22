@@ -10,6 +10,7 @@
 import * as THREE from "three";
 import { RNG, damp } from "../core/math";
 import type { World } from "../game/world";
+import { spaceBlend } from "../game/phaseBlend";
 
 const HEIGHT = 560;
 const BACK = 430;
@@ -20,6 +21,10 @@ export class FollowCamera {
   private trauma = 0;
   private readonly rng = new RNG(7331);
   private shakeT = 0;
+  private titleK = 0;
+  private clock = 0;
+  /** True on the title screen: draw in close on the hero and sway slowly, like a character select. */
+  titleFraming = false;
 
   constructor(private readonly camera: THREE.PerspectiveCamera) {
     this.camera.position.set(0, HEIGHT, BACK);
@@ -31,10 +36,25 @@ export class FollowCamera {
     return HEIGHT * 1.55;
   }
 
-  update(world: World, dt: number): void {
+  /**
+   * `focus` (boss intro): w=0 follows the player, w=1 frames (x, y) and moves
+   * in closer. The weight itself is eased by the caller, so no extra damping.
+   */
+  update(world: World, dt: number, focus?: { x: number; y: number; w: number }): void {
     const p = world.player;
+    // Orbit sits a little higher (more room to drift); launch/descent swoop up and back.
+    const k = spaceBlend(world.phase, world.phaseT);
+    const w = focus?.w ?? 0;
+    this.titleK = damp(this.titleK, this.titleFraming ? 1 : 0, 3, dt);
+    this.clock += dt;
+    const lift = (1 + 0.22 * k + 0.7 * Math.sin(Math.PI * k)) * (1 - 0.12 * w) * (1 - 0.58 * this.titleK);
+    const height = HEIGHT * lift;
+    const back = BACK * (1 + 0.15 * k) * (1 - 0.12 * w) * (1 - 0.46 * this.titleK);
     this.x = damp(this.x, p.x, 7, dt);
     this.y = damp(this.y, p.y, 7, dt);
+    const sway = Math.sin(this.clock * 0.35) * 34 * this.titleK;
+    const cx = (focus ? this.x + (focus.x - this.x) * w : this.x) + sway;
+    const cy = focus ? this.y + (focus.y - this.y) * w : this.y;
 
     this.trauma = Math.max(0, this.trauma + world.consumeTrauma() - dt * 1.4);
     this.trauma = Math.min(1, this.trauma);
@@ -46,8 +66,8 @@ export class FollowCamera {
     const jz = shake * 22 * (this.rng.next() * 2 - 1);
 
     // Ground plane (x,y) maps to Three.js world (X,Z); Y is up.
-    this.camera.position.set(this.x + jx, HEIGHT + jy, this.y + BACK + jz);
-    this.camera.lookAt(this.x, 24, this.y);
+    this.camera.position.set(cx + jx, height + jy, cy + back + jz);
+    this.camera.lookAt(cx - sway, 24 + 130 * w + 46 * this.titleK, cy); // aim up the boss's body, not at its feet
     this.camera.rotation.z += shake * 0.02 * (this.rng.next() * 2 - 1);
   }
 }

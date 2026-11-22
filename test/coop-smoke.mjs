@@ -101,7 +101,9 @@ try {
     const page = await ctx.newPage();
     page.on("pageerror", (e) => errors.push(`${label} pageerror: ${e.message}`));
     page.on("console", (m) => {
-      if (m.type() === "error") errors.push(`${label} console: ${m.text()}`);
+      // Nexconn SDK 26.5 posts its own logs to logcollection.ronghub.com, which the
+      // browser blocks (CORS). That's the SDK's telemetry, not this app.
+      if (m.type() === "error" && !/ronghub\.com|ERR_FAILED/.test(m.text())) errors.push(`${label} console: ${m.text()}`);
     });
     await page.goto(url + path, { waitUntil: "load", timeout: 60_000 });
     return page;

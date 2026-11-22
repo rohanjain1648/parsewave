@@ -6,10 +6,14 @@
  */
 import * as THREE from "three";
 import { clamp } from "../core/math";
-import { COOP, PALETTE } from "../game/config";
+import { COOP, PALETTE, PLAYER } from "../game/config";
 import type { Player } from "../game/player";
 import type { World } from "../game/world";
-import { RobotFactory, type RobotHandle } from "./robots";
+import type { RobotHandle } from "./robots";
+import type { ModelLibrary } from "./modelLibrary";
+import { PLAYER_ROLE, roleForEnemy, SHIP_ROLE } from "./manifest";
+import { spaceBlend } from "../game/phaseBlend";
+import { Shatters } from "./shatter";
 import { createFxPools, RingPool, type FxPools } from "./fx";
 
 const hexToNum = (s: string): number => parseInt(s.replace("#", ""), 16);
@@ -32,15 +36,31 @@ const ORBITALS_PER_PLAYER = 8;
 /** Per-slot visuals for one player robot. */
 interface PlayerVisual {
   robot: RobotHandle;
+  /** The fighter this robot flies in orbit. */
+  ship: RobotHandle;
+  /** Smoothed bank angle and last heading, for rolling the ship into turns. */
+  roll: number;
+  lastFacing: number;
   orbitals: THREE.Mesh[];
   /** Faint full ring + a bright arc whose draw range grows with revive progress. */
   reviveBg: THREE.Mesh;
   reviveArc: THREE.Mesh;
 }
 
+/** One enemy pool slot's model. Slots get reused by other enemy kinds, so the model can swap. */
+interface EnemySlot {
+  role: string;
+  h: RobotHandle;
+  /** Shown last frame: dying now means a shatter burst. */
+  alive: boolean;
+  boss: boolean;
+}
+
 export class WorldView {
   private readonly playerVisuals: PlayerVisual[] = [];
-  private readonly robots: RobotHandle[] = [];
+  private readonly enemySlots: (EnemySlot | null)[] = [];
+  /** Idle model instances per role, reused when an enemy slot changes kind. */
+  private readonly spare = new Map<string, RobotHandle[]>();
   private readonly pingBeams: THREE.Mesh[] = [];
   private pickupRing!: THREE.Mesh;
   private novaRings!: RingPool;
@@ -49,11 +69,15 @@ export class WorldView {
   readonly floatLabels: FloatLabel[] = [];
   /** World-space scale applied to every robot instance; calibrated once the model loads. */
   robotBaseScale = 60;
+  /** Model role of the current Forge boss, once loaded; forged bosses use it. */
+  forgeRole: string | null = null;
+  private readonly shatters: Shatters;
 
   constructor(
     private readonly scene: THREE.Scene,
-    private readonly factory: RobotFactory,
+    private readonly factory: ModelLibrary,
   ) {
+    this.shatters = new Shatters(scene);
     for (let slot = 0; slot < COOP.maxPlayers; slot++) this.playerVisuals.push(this.createPlayerVisual(slot));
 
     // Ping beams: at most one live ping per player per cooldown window.
@@ -90,13 +114,26 @@ export class WorldView {
     });
   }
 
+  /** Recolour one player's robot and ship (the app tints your robot by its class; null = slot colour). */
+  setPlayerTint(slot: number, color: string | null): void {
+    const v = this.playerVisuals[slot];
+    if (!v) return;
+    const hex = hexToNum(color ?? COOP.slotColors[slot]);
+    v.robot.setTint(hex);
+    v.ship.setTint(hex);
+  }
+
   private createPlayerVisual(slot: number): PlayerVisual {
     const color = hexToNum(COOP.slotColors[slot]);
-    const robot = this.factory.create();
+    const robot = this.factory.create(PLAYER_ROLE);
     robot.setTint(color);
     robot.root.castShadow = true;
     robot.root.visible = false;
     this.scene.add(robot.root);
+    const ship = this.factory.create(SHIP_ROLE);
+    ship.setTint(color);
+    ship.root.visible = false;
+    this.scene.add(ship.root);
 
     const orbitals: THREE.Mesh[] = [];
     for (let i = 0; i < ORBITALS_PER_PLAYER; i++) {
@@ -125,7 +162,7 @@ export class WorldView {
       this.scene.add(m);
       return m;
     };
-    return { robot, orbitals, reviveBg: flatRing(0.18), reviveArc: flatRing(0.9) };
+    return { robot, ship, roll: 0, lastFacing: 0, orbitals, reviveBg: flatRing(0.18), reviveArc: flatRing(0.9) };
   }
 
   /** Call once the GLB has loaded to size robots sensibly relative to the arena. */
@@ -134,14 +171,25 @@ export class WorldView {
     this.robotBaseScale = natural > 0 ? desiredPlayerHeight / natural : this.robotBaseScale;
   }
 
-  private ensureRobotCapacity(n: number): void {
-    while (this.robots.length < n) {
-      const h = this.factory.create();
+  /** The model for enemy slot i, swapped to the right role's model if the slot changed kind. */
+  private enemyModel(i: number, role: string): RobotHandle {
+    const cur = this.enemySlots[i];
+    if (cur && cur.role === role) return cur.h;
+    if (cur) {
+      cur.h.root.visible = false;
+      let list = this.spare.get(cur.role);
+      if (!list) this.spare.set(cur.role, (list = []));
+      list.push(cur.h);
+    }
+    let h = this.spare.get(role)?.pop();
+    if (!h) {
+      h = this.factory.create(role);
       h.root.visible = false;
       h.root.castShadow = true;
       this.scene.add(h.root);
-      this.robots.push(h);
     }
+    this.enemySlots[i] = { role, h, alive: false, boss: false };
+    return h;
   }
 
   sync(world: World, dt: number): void {
@@ -172,19 +220,35 @@ export class WorldView {
     }
 
     // --- Enemies --------------------------------------------------------
-    this.ensureRobotCapacity(world.enemies.length);
     for (let i = 0; i < world.enemies.length; i++) {
       const e = world.enemies[i];
-      const h = this.robots[i];
       if (e.dead) {
-        h.root.visible = false;
+        const slot = this.enemySlots[i];
+        if (slot) {
+          if (slot.alive && slot.h.root.visible) {
+            // It just died: break its own model apart.
+            this.shatters.spawn(this.factory.chunks(slot.role, slot.h), slot.h.body.matrixWorld, slot.boss ? 2.2 : 1);
+          }
+          slot.alive = false;
+          slot.h.root.visible = false;
+        }
         continue;
       }
+      const h = this.enemyModel(i, e.forged && this.forgeRole ? this.forgeRole : roleForEnemy(e.kind));
+      const slotInfo = this.enemySlots[i]!;
+      slotInfo.alive = true;
+      slotInfo.boss = e.isBoss;
       h.root.visible = true;
       h.root.position.set(e.x, 0, e.y);
-      const target = nearestActive(world.players, e.x, e.y) ?? p;
-      const angle = Math.atan2(target.y - e.y, target.x - e.x);
-      h.root.rotation.y = FORWARD_OFFSET - angle;
+      if (e.kind === "asteroid") {
+        // Rocks tumble along their drift instead of turning to face anyone.
+        h.root.rotation.y += dt * (0.4 + (i % 5) * 0.15);
+        h.root.rotation.x += dt * 0.25;
+      } else {
+        const target = nearestActive(world.players, e.x, e.y) ?? p;
+        const angle = Math.atan2(target.y - e.y, target.x - e.x);
+        h.root.rotation.y = FORWARD_OFFSET - angle;
+      }
 
       const spawnIn = e.spawnT < 0.4;
       const spawnScale = spawnIn ? clamp(e.spawnT / 0.4, 0.15, 1) : 1;
@@ -192,35 +256,58 @@ export class WorldView {
 
       h.play(spawnIn ? "Idle" : e.anim, 0.2);
       h.setSpeed(spawnIn ? 1 : e.animSpeed);
-      h.setTint(e.flash > 0 ? 0xffffff : hexToNum(e.color));
+      h.setTint(hexToNum(e.color));
+      h.setFlash(e.flash > 0);
+      h.setBroken?.(!!e.enraged);
       h.update(dt);
     }
 
     this.syncFx(world);
+    // Pieces fall and skid on the ground; in orbit they just drift.
+    this.shatters.update(dt, spaceBlend(world.phase, world.phaseT) < 0.5 ? 900 : 0);
   }
 
   private syncPlayer(world: World, v: PlayerVisual, p: Player | undefined, isLocal: boolean, dt: number): void {
     const shown = !!p && p.active;
-    v.robot.root.visible = shown;
+    // Robot on the ground, fighter in orbit; the swap happens halfway through launch/descent.
+    const k = spaceBlend(world.phase, world.phaseT);
+    const inShip = k >= 0.5;
+    v.robot.root.visible = shown && !inShip;
+    v.ship.root.visible = shown && inShip;
     v.reviveBg.visible = v.reviveArc.visible = shown && p.downed && !world.gameOver;
     if (!shown) {
       for (const o of v.orbitals) o.visible = false;
       return;
     }
 
-    const r = v.robot;
-    const moving = Math.hypot(p.vx, p.vy) > 12;
-    r.root.position.set(p.x, 0, p.y);
+    const transition = world.phase === "launch" || world.phase === "descent";
+    const altitude = Math.sin(Math.PI * k) * 70; // a little lift-off during the flight up / down
+    // Blink only for post-hit i-frames, not the longer boss-intro grace.
+    const blinking = !transition && p.invuln > 0 && p.invuln <= PLAYER.iFrames && Math.floor(world.time * 20) % 2 === 0;
+    const r = inShip ? v.ship : v.robot;
+    r.root.position.set(p.x, altitude, p.y);
     r.root.rotation.y = FORWARD_OFFSET - p.facing;
     r.root.scale.setScalar(this.robotBaseScale);
-    if (world.gameOver || p.downed) {
+
+    if (inShip) {
+      // Bank into turns: roll follows the rate of heading change.
+      let turn = p.facing - v.lastFacing;
+      if (turn > Math.PI) turn -= Math.PI * 2;
+      if (turn < -Math.PI) turn += Math.PI * 2;
+      const target = clamp((turn / Math.max(dt, 1e-3)) * 0.12, -0.7, 0.7);
+      v.roll += (target - v.roll) * Math.min(1, dt * 6);
+      r.root.rotation.z = p.downed ? 1.2 : v.roll;
+      r.root.visible = !blinking;
+      r.play(Math.hypot(p.vx, p.vy) > 30 ? "Running" : "Idle");
+    } else if (world.gameOver || p.downed) {
       r.play("Death", 0.2);
     } else {
+      const moving = Math.hypot(p.vx, p.vy) > 12;
       r.play(moving ? "Running" : "Idle", 0.15);
       r.setSpeed(moving ? 1.15 : 1);
-      const blinking = p.invuln > 0 && Math.floor(world.time * 20) % 2 === 0;
       r.root.visible = !blinking;
     }
+    v.lastFacing = p.facing;
     r.update(dt);
 
     if (p.downed) {

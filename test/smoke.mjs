@@ -46,7 +46,9 @@ try {
   });
   if (!gl) throw new Error("WebGL context unavailable — 3D scene cannot render");
 
-  await page.mouse.click(640, 500); // start (Play button)
+  // Start with the real BEGIN THE RUN button, wherever the title layout puts it.
+  const solo = (await page.evaluate(() => window.__nova())).ui.title.solo;
+  await page.mouse.click(solo.x + solo.w / 2, solo.y + solo.h / 2);
   await page.waitForTimeout(300);
 
   // Play ~22s: ping-pong to survive + collect XP, auto-pick upgrades. The

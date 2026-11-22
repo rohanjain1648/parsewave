@@ -1,13 +1,42 @@
 /**
- * Unified input: keyboard (WASD/arrows) + pointer (mouse/touch drag).
+ * Unified input: keyboard (WASD/arrows) + pointer (mouse/touch).
  *
  * Exposes a normalized movement vector so gameplay code never cares whether
- * the player is on desktop or mobile. On touch, dragging anywhere produces a
- * virtual analogue stick relative to the touch's origin.
+ * the player is on desktop or mobile. Touch has two schemes:
+ *  - website (default): dragging anywhere is a virtual stick that moves and fires;
+ *  - app (`dualSticks`): a finger on the LEFT half spawns a move stick where it
+ *    lands, a finger on the RIGHT half spawns an aim stick that fires while held.
+ *    Both work at once (multi-touch). Reserved rects (pause, dash, ping buttons)
+ *    stay plain taps and never become sticks.
  */
 
 import { clamp, len } from "./math";
 import type { PlayerInput } from "../game/types";
+
+type Zone = "move" | "aim";
+
+interface StickPointer {
+  zone: Zone;
+  originX: number;
+  originY: number;
+  x: number;
+  y: number;
+}
+
+/** Renderable stick geometry, in CSS pixels. */
+export interface StickView {
+  active: boolean;
+  baseX: number;
+  baseY: number;
+  knobX: number;
+  knobY: number;
+  radius: number;
+}
+
+const STICK_RADIUS = 62; // max knob travel from the base, CSS px
+const STICK_DEAD = 6; // ignore jitter within this radius
+
+const mkStick = (): StickView => ({ active: false, baseX: 0, baseY: 0, knobX: 0, knobY: 0, radius: STICK_RADIUS });
 
 export class Input {
   private keys = new Set<string>();
@@ -17,6 +46,8 @@ export class Input {
   private pointerX = 0;
   private pointerY = 0;
   private usingTouch = false;
+  /** Last mouse position, tracked even with no button held (for hover states). Null on touch devices. */
+  private hover: { x: number; y: number } | null = null;
 
   /** One-shot "confirm/start" edge, consumed by the UI layer. */
   private pressedConfirm = false;
@@ -35,7 +66,16 @@ export class Input {
   /** True when the current move vector came from a touch drag. */
   private moveFromTouch = false;
 
-  constructor(target: HTMLElement) {
+  /** App mode: two floating thumbsticks instead of one drag. */
+  private readonly dualSticks: boolean;
+  private sticks = new Map<number, StickPointer>();
+  private reserved: { x: number; y: number; w: number; h: number }[] = [];
+  private dashRequested = false;
+  readonly leftStick: StickView = mkStick();
+  readonly rightStick: StickView = mkStick();
+
+  constructor(target: HTMLElement, opts: { dualSticks?: boolean } = {}) {
+    this.dualSticks = !!opts.dualSticks;
     addEventListener("keydown", this.onKeyDown, { passive: false });
     addEventListener("keyup", this.onKeyUp);
     target.addEventListener("pointerdown", this.onPointerDown);
@@ -60,6 +100,7 @@ export class Input {
       if (e.code === "Digit1" || e.code === "Numpad1") this.numberPressed = 1;
       if (e.code === "Digit2" || e.code === "Numpad2") this.numberPressed = 2;
       if (e.code === "Digit3" || e.code === "Numpad3") this.numberPressed = 3;
+      if (e.code === "Digit4" || e.code === "Numpad4") this.numberPressed = 4;
     }
     this.keys.add(e.code);
   };
@@ -70,6 +111,7 @@ export class Input {
 
   private onPointerDown = (e: PointerEvent): void => {
     this.usingTouch = e.pointerType === "touch";
+    this.hover = this.usingTouch ? null : { x: e.clientX, y: e.clientY };
     this.pointerActive = true;
     this.pointerOriginX = this.pointerX = e.clientX;
     this.pointerOriginY = this.pointerY = e.clientY;
@@ -77,22 +119,49 @@ export class Input {
     this.clicked = true;
     this.clickX = e.clientX;
     this.clickY = e.clientY;
+    if (this.dualSticks && this.usingTouch) {
+      this.pointerActive = false; // touches drive the sticks, not the single-drag stick
+      for (const r of this.reserved) {
+        if (e.clientX >= r.x && e.clientX <= r.x + r.w && e.clientY >= r.y && e.clientY <= r.y + r.h) return;
+      }
+      const zone: Zone = e.clientX < innerWidth / 2 ? "move" : "aim";
+      for (const p of this.sticks.values()) if (p.zone === zone) return; // one finger per half
+      this.sticks.set(e.pointerId, { zone, originX: e.clientX, originY: e.clientY, x: e.clientX, y: e.clientY });
+    }
   };
 
   private onPointerMove = (e: PointerEvent): void => {
+    if (e.pointerType !== "touch") this.hover = { x: e.clientX, y: e.clientY };
+    const stick = this.sticks.get(e.pointerId);
+    if (stick) {
+      stick.x = e.clientX;
+      stick.y = e.clientY;
+    }
     if (!this.pointerActive) return;
     this.pointerX = e.clientX;
     this.pointerY = e.clientY;
   };
 
-  private onPointerUp = (): void => {
+  private onPointerUp = (e: PointerEvent): void => {
+    if (this.sticks.delete(e.pointerId)) return;
     this.pointerActive = false;
   };
 
   private releaseAll = (): void => {
     this.keys.clear();
     this.pointerActive = false;
+    this.sticks.clear();
   };
+
+  /** App mode: screen rects (CSS px) where a touch is a tap only, never a stick. */
+  setReserved(rects: { x: number; y: number; w: number; h: number }[]): void {
+    this.reserved = rects;
+  }
+
+  /** The on-screen DASH button was tapped: dash on the next sim step. */
+  requestDash(): void {
+    this.dashRequested = true;
+  }
 
   isDown(...codes: string[]): boolean {
     return codes.some((c) => this.keys.has(c));
@@ -102,10 +171,14 @@ export class Input {
   consumeConfirm(): boolean {
     const v = this.pressedConfirm;
     this.pressedConfirm = false;
+    // Drain the raw Enter/Space edges too, so a stale menu confirm can't be picked up
+    // later by an unrelated consumeKey() (e.g. instantly un-pausing).
+    this.edges.delete("Space");
+    this.edges.delete("Enter");
     return v;
   }
 
-  /** Read + clear a 1..3 selection edge (0 = none). */
+  /** Read + clear a 1..4 selection edge (0 = none). */
   consumeNumber(): number {
     const v = this.numberPressed;
     this.numberPressed = 0;
@@ -132,6 +205,11 @@ export class Input {
     return { x: this.pointerX, y: this.pointerY };
   }
 
+  /** Where the mouse is right now (no button needed), or null if there is no mouse. */
+  get hoverPoint(): { x: number; y: number } | null {
+    return this.hover;
+  }
+
   get isPointerActive(): boolean {
     return this.pointerActive;
   }
@@ -150,7 +228,30 @@ export class Input {
     if (this.isDown("KeyS", "ArrowDown")) y += 1;
 
     this.moveFromTouch = false;
-    if (x === 0 && y === 0 && this.pointerActive && this.usingTouch) {
+    this.leftStick.active = false;
+    this.rightStick.active = false;
+    if (this.dualSticks) {
+      if (x === 0 && y === 0) {
+        const mp = this.findStick("move");
+        if (mp) {
+          const v = this.stickVector(mp, this.leftStick);
+          x = v.x;
+          y = v.y;
+        }
+      }
+      const ap = this.findStick("aim");
+      if (ap) {
+        // A finger in the aim half fires the whole time it's held; the heading only
+        // changes once the thumb leaves the dead zone, so a tap keeps the last aim.
+        const v = this.stickVector(ap, this.rightStick);
+        const m = len(v.x, v.y);
+        if (m > 0.0001) {
+          this.aim.x = v.x / m;
+          this.aim.y = v.y / m;
+        }
+      }
+    }
+    if (!this.dualSticks && x === 0 && y === 0 && this.pointerActive && this.usingTouch) {
       // Touch virtual stick: vector from where the finger went down.
       // (Mouse never moves the robot — the cursor is aim-only, see below.)
       const dx = this.pointerX - this.pointerOriginX;
@@ -168,8 +269,8 @@ export class Input {
 
     // Mouse aim: while the button is held, the aim vector points from the
     // screen centre (the camera keeps the robot there) toward the cursor.
-    this.aim.active = this.pointerActive && !this.usingTouch;
-    if (this.aim.active) {
+    this.aim.active = (this.pointerActive && !this.usingTouch) || this.rightStick.active;
+    if (this.aim.active && !this.rightStick.active) {
       const dx = this.pointerX - innerWidth / 2;
       const dy = this.pointerY - innerHeight / 2;
       const l = len(dx, dy);
@@ -199,7 +300,36 @@ export class Input {
       aimX: this.aim.x,
       aimY: this.aim.y,
       firing: this.aim.active || this.moveFromTouch,
+      // One edge per press: Shift or E.
+      dash: this.consumeKey("ShiftLeft") || this.consumeKey("ShiftRight") || this.consumeKey("KeyE") || this.takeDash(),
     };
+  }
+
+  private takeDash(): boolean {
+    const v = this.dashRequested;
+    this.dashRequested = false;
+    return v;
+  }
+
+  private findStick(zone: Zone): StickPointer | null {
+    for (const p of this.sticks.values()) if (p.zone === zone) return p;
+    return null;
+  }
+
+  /** Update a stick's render geometry and return its analogue vector (0..1, zero in the dead zone). */
+  private stickVector(p: StickPointer, view: StickView): { x: number; y: number } {
+    const dx = p.x - p.originX;
+    const dy = p.y - p.originY;
+    const d = len(dx, dy);
+    const travel = Math.min(d, view.radius);
+    view.active = true;
+    view.baseX = p.originX;
+    view.baseY = p.originY;
+    view.knobX = d > 0 ? p.originX + (dx / d) * travel : p.originX;
+    view.knobY = d > 0 ? p.originY + (dy / d) * travel : p.originY;
+    if (d <= STICK_DEAD) return { x: 0, y: 0 };
+    const mag = clamp((d - STICK_DEAD) / (view.radius - STICK_DEAD), 0, 1);
+    return { x: (dx / d) * mag, y: (dy / d) * mag };
   }
 
   /** True while a touch drag is driving movement (mobile fires while moving). */

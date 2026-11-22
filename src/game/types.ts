@@ -35,6 +35,10 @@ export interface Enemy {
   spawnT: number; // time alive, for spawn-in animation
   /** Countdown after landing a contact hit; the app plays the Punch clip while > 0. */
   punchT: number;
+  /** A boss wearing the player's Forge model (visual + name only; stats are unchanged). */
+  forged?: boolean;
+  /** Capital ship below half health: its bridge is blown off and it fires faster. */
+  enraged?: boolean;
 }
 
 export interface Bullet {
@@ -115,6 +119,8 @@ export interface PlayerInput {
   aimX: number;
   aimY: number;
   firing: boolean;
+  /** Dash pressed this tick (a one-tick edge). */
+  dash: boolean;
 }
 
 export const IDLE_INPUT: Readonly<PlayerInput> = Object.freeze({
@@ -124,4 +130,5 @@ export const IDLE_INPUT: Readonly<PlayerInput> = Object.freeze({
   aimX: 1,
   aimY: 0,
   firing: false,
+  dash: false,
 });

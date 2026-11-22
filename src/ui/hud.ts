@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import { clamp } from "../core/math";
-import { COOP, PALETTE } from "../game/config";
+import { edgeProximity } from "../game/arena";
+import { COOP, PALETTE, PLAYER, WORLD } from "../game/config";
+import type { EnemyKind } from "../game/config";
 import type { World } from "../game/world";
 import type { Rect } from "./screens";
 
@@ -42,8 +44,26 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
 }
 
 /** Touch-friendly ping button (co-op only), bottom-right above the safe area. */
+const HUD_PAD = 16;
+const hpBarWidth = (w: number): number => Math.min(240, w * 0.4);
+
+/** The dash meter under the HP bar, including its "DASH  SHIFT / E" label. */
+export function dashMeterRect(w: number): Rect {
+  return { x: HUD_PAD, y: 54, w: hpBarWidth(w) * 0.55 + 8 + 100, h: 10 };
+}
+
+/** One teammate row (name + HP bar) in the co-op HUD, stacked under the dash meter. */
+export function teammateRowRect(row: number): Rect {
+  return { x: HUD_PAD, y: 71 + row * 22, w: 96 + 90, h: 12 };
+}
+
 export function pingButtonRect(w: number, h: number): Rect {
   return { x: w - 16 - 64, y: h - 16 - 64, w: 64, h: 64 };
+}
+
+export interface HudOptions {
+  /** App build: no keyboard hints (there's a pause button), radar top-right clear of the thumb buttons. */
+  touch?: boolean;
 }
 
 /** Draw the in-game HUD in screen space (no camera transform). */
@@ -54,9 +74,10 @@ export function drawHud(
   w: number,
   h: number,
   camera?: THREE.Camera,
+  opts: HudOptions = {},
 ): void {
   const p = world.player;
-  const pad = 16;
+  const pad = HUD_PAD;
 
   // XP bar across the very top
   bar(ctx, 0, 0, w, 6, world.xp / world.xpToNext, PALETTE.xp, "rgba(255,255,255,0.05)");
@@ -69,12 +90,22 @@ export function drawHud(
   ctx.fillText(`LV ${world.level}`, pad, 14);
 
   // HP bar (top-left, under level)
-  const hpW = Math.min(240, w * 0.4);
+  const hpW = hpBarWidth(w);
   bar(ctx, pad, 36, hpW, 14, p.hp / p.maxHp, p.hp / p.maxHp < 0.35 ? PALETTE.danger : "#4dff9b");
   ctx.font = "700 12px 'Segoe UI', system-ui, sans-serif";
   ctx.fillStyle = PALETTE.text;
   ctx.textBaseline = "middle";
   ctx.fillText(`${Math.max(0, Math.ceil(p.hp))} / ${p.maxHp}`, pad + 8, 36 + 7);
+
+  // Dash meter (under HP): fills as it recharges, lights up when ready.
+  const dashReady = p.dashCd <= 0;
+  const dashFrac = dashReady ? 1 : 1 - p.dashCd / PLAYER.dash.cooldown;
+  bar(ctx, pad, 56, hpW * 0.55, 6, dashFrac, dashReady ? PALETTE.player : "rgba(63,233,255,0.4)", "rgba(255,255,255,0.08)");
+  ctx.font = "800 10px 'Segoe UI', system-ui, sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = dashReady ? PALETTE.player : "rgba(230,244,255,0.5)";
+  ctx.fillText(dashReady && !opts.touch ? "DASH  SHIFT / E" : "DASH", pad + hpW * 0.55 + 8, 59);
 
   // Timer + kills (top-center)
   ctx.textAlign = "center";
@@ -92,7 +123,8 @@ export function drawHud(
     const bw = Math.min(420, w * 0.6);
     ctx.font = "800 12px 'Segoe UI', system-ui, sans-serif";
     ctx.fillStyle = "#ffd27a";
-    ctx.fillText("◆ WARDEN ◆", w / 2, 74);
+    const label = world.bossLabel;
+    ctx.fillText(`◆ ${label.length > 40 ? label.slice(0, 39) + "…" : label} ◆`, w / 2, 74);
     bar(ctx, w / 2 - bw / 2, 90, bw, 12, bossFrac, "#ffcf5a", "rgba(255,80,80,0.15)");
   }
 
@@ -102,6 +134,8 @@ export function drawHud(
   ];
   if (p.orbital > 0) chips.push({ icon: "◉", lvl: p.orbital, color: PALETTE.orbital });
   if (p.nova > 0) chips.push({ icon: "◎", lvl: p.nova, color: PALETTE.nova });
+  if (p.chain > 0) chips.push({ icon: "↯", lvl: p.chain, color: PALETTE.chain });
+  if (p.lance > 0) chips.push({ icon: "▬", lvl: p.lance, color: PALETTE.lance });
   let cx = pad;
   const cy = h - 44;
   for (const c of chips) {
@@ -124,22 +158,163 @@ export function drawHud(
   ctx.textBaseline = "top";
   ctx.font = "700 13px 'Segoe UI', system-ui, sans-serif";
   ctx.fillStyle = "rgba(230,244,255,0.55)";
-  ctx.fillText(muted ? "🔇 M" : "🔊 M", w - pad, 14);
-  ctx.fillText(world.spectating ? "ESC menu" : world.players.length > 1 ? "ESC menu · G ping" : "ESC pause", w - pad, 34);
+  if (!opts.touch) {
+    ctx.fillText(muted ? "🔇 M" : "🔊 M", w - pad, 14);
+    ctx.fillText(world.spectating ? "ESC menu" : world.players.length > 1 ? "ESC menu · G ping" : "ESC pause", w - pad, 34);
+  }
+
+  drawEdgeWarning(ctx, world, w, h);
+  if (world.phase === "orbit") drawRadar(ctx, world, w, h, !!opts.touch);
 
   if (world.players.length > 1) {
-    drawTeammates(ctx, world, pad, 60);
+    drawTeammates(ctx, world);
     if (camera) drawEdgeArrows(ctx, world, camera, w, h);
     if (!world.spectating) drawPingButton(ctx, world, w, h);
   }
 }
 
+/**
+ * Radar size and position: bottom-right, clear of the co-op ping button. In the app
+ * (`top`) it sits top-right under the pause button, away from the DASH button and thumbs.
+ */
+export function radarRect(w: number, h: number, coop: boolean, top = false): Rect {
+  const s = Math.round(clamp(Math.min(w, h) * (top ? 0.24 : 0.26), 88, 168));
+  if (top) return { x: w - 16 - s, y: 12 + 46 + 26, w: s, h: s };
+  const lift = coop ? 64 + 12 : 0;
+  return { x: w - 16 - s, y: h - 16 - s - lift, w: s, h: s };
+}
+
+/** Sector name for a world position: columns A-D left to right, rows 1-4 top to bottom. */
+export function sectorName(x: number, y: number): string {
+  const half = WORLD.half;
+  const col = clamp(Math.floor(((x + half) / (half * 2)) * 4), 0, 3);
+  const row = clamp(Math.floor(((y + half) / (half * 2)) * 4), 0, 3);
+  return `${"ABCD"[col]}${row + 1}`;
+}
+
+/**
+ * Red vignette and a message when the ship nears the wall of the combat zone, so the
+ * limit never comes as a surprise. Works on the surface too.
+ */
+function drawEdgeWarning(ctx: CanvasRenderingContext2D, world: World, w: number, h: number): void {
+  if (world.phase === "launch" || world.phase === "descent") return;
+  const prox = edgeProximity(world.player.x, world.player.y);
+  if (prox < 0.25) return;
+  const k = (prox - 0.25) / 0.75;
+  const pulse = 0.75 + 0.25 * Math.sin(performance.now() / 90);
+  const g = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.75);
+  g.addColorStop(0, "rgba(255,40,70,0)");
+  g.addColorStop(1, `rgba(255,40,70,${(0.45 * k * pulse).toFixed(3)})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = "900 15px 'Segoe UI', system-ui, sans-serif";
+  ctx.fillStyle = `rgba(255,120,130,${(0.5 + 0.5 * k).toFixed(2)})`;
+  ctx.fillText(world.phase === "orbit" ? "◄ COMBAT ZONE EDGE · TURN BACK ►" : "ARENA EDGE", w / 2, Math.round(h * 0.2));
+}
+
+const RADAR_DOT: Partial<Record<EnemyKind, string>> = {
+  asteroid: "rgba(160,170,190,0.7)",
+  kamikaze: "#ff9a3d",
+  bomber: "#ff7ab0",
+};
+
+/**
+ * Orbit radar: the whole combat zone as a square map (it IS a square, matching the real
+ * limit), with sector grid, enemies, the capital ship, teammates and your own ship. This is
+ * how you pick which part of the arena to fight in and fly there without guessing.
+ */
+function drawRadar(ctx: CanvasRenderingContext2D, world: World, w: number, h: number, top: boolean): void {
+  const r = radarRect(w, h, world.players.length > 1, top);
+  const half = WORLD.half;
+  const sx = (x: number): number => r.x + ((x + half) / (half * 2)) * r.w;
+  const sy = (y: number): number => r.y + ((y + half) / (half * 2)) * r.h;
+  const p = world.player;
+  const prox = edgeProximity(p.x, p.y);
+
+  ctx.save();
+  ctx.fillStyle = "rgba(4,10,24,0.72)";
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  // Sector grid (4 x 4).
+  ctx.strokeStyle = "rgba(120,200,255,0.18)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 1; i < 4; i++) {
+    ctx.moveTo(r.x + (r.w * i) / 4, r.y);
+    ctx.lineTo(r.x + (r.w * i) / 4, r.y + r.h);
+    ctx.moveTo(r.x, r.y + (r.h * i) / 4);
+    ctx.lineTo(r.x + r.w, r.y + (r.h * i) / 4);
+  }
+  ctx.stroke();
+  // Sector letters along the top, numbers down the left.
+  ctx.font = "700 9px 'Segoe UI', system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "rgba(160,215,255,0.5)";
+  for (let i = 0; i < 4; i++) {
+    ctx.fillText("ABCD"[i], r.x + (r.w * (i + 0.5)) / 4, r.y + 2);
+    ctx.textAlign = "left";
+    ctx.fillText(`${i + 1}`, r.x + 3, r.y + (r.h * (i + 0.5)) / 4 - 4);
+    ctx.textAlign = "center";
+  }
+  // Border: cyan, flashing red at the edge.
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = prox > 0.25 ? `rgba(255,${Math.round(90 - 50 * prox)},80,0.95)` : "rgba(90,215,255,0.9)";
+  ctx.strokeRect(r.x, r.y, r.w, r.h);
+
+  // Enemies.
+  for (const e of world.enemies) {
+    if (e.dead) continue;
+    const big = e.isBoss || e.kind === "capital";
+    ctx.fillStyle = big ? "#ffcf5a" : RADAR_DOT[e.kind] ?? "#ff5a5a";
+    const d = big ? 7 : e.kind === "asteroid" ? 3 : 3.5;
+    if (big) {
+      ctx.fillRect(sx(e.x) - d / 2, sy(e.y) - d / 2, d, d);
+      ctx.strokeStyle = "rgba(255,207,90,0.8)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(sx(e.x) - d, sy(e.y) - d, d * 2, d * 2);
+    } else {
+      ctx.fillRect(sx(e.x) - d / 2, sy(e.y) - d / 2, d, d);
+    }
+  }
+  // Teammates.
+  for (const o of world.players) {
+    if (!o.active || o.slot === world.localSlot) continue;
+    ctx.fillStyle = COOP.slotColors[o.slot] ?? PALETTE.player;
+    ctx.beginPath();
+    ctx.arc(sx(o.x), sy(o.y), 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // You: a ship-shaped arrow pointing along your facing.
+  ctx.translate(sx(p.x), sy(p.y));
+  ctx.rotate(p.facing);
+  ctx.fillStyle = PALETTE.player;
+  ctx.beginPath();
+  ctx.moveTo(7, 0);
+  ctx.lineTo(-5, -4.5);
+  ctx.lineTo(-2.5, 0);
+  ctx.lineTo(-5, 4.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // Caption: sector of the ship.
+  ctx.font = "800 11px 'Segoe UI', system-ui, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillStyle = "rgba(190,230,255,0.85)";
+  ctx.fillText(`COMBAT ZONE · SECTOR ${sectorName(p.x, p.y)}`, r.x + r.w, r.y - 4);
+}
+
 /** Teammate rows under your HP bar: name in slot colour, mini HP bar, DOWN tag. */
-function drawTeammates(ctx: CanvasRenderingContext2D, world: World, x: number, y: number): void {
+function drawTeammates(ctx: CanvasRenderingContext2D, world: World): void {
   let row = 0;
   for (const p of world.players) {
     if (!p.active || p.slot === world.localSlot) continue;
-    const ry = y + row * 22;
+    const r = teammateRowRect(row);
+    const x = r.x;
+    const ry = r.y + 1; // the bar's top; the name is centred on it
     const color = COOP.slotColors[p.slot] ?? PALETTE.player;
     ctx.font = "800 12px 'Segoe UI', system-ui, sans-serif";
     ctx.textAlign = "left";

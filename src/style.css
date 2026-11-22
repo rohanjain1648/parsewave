@@ -1,6 +1,12 @@
 :root {
   color-scheme: dark;
   --bg: #05060a;
+  /* Notch / rounded-corner insets (non-zero only with viewport-fit=cover on devices
+     that report them). Read in JS so the canvas HUD and touch buttons stay clear. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
 }
 
 * {
@@ -111,6 +117,31 @@ body::after {
 .code-card input:focus {
   outline: 2px solid #3fe9ff;
   outline-offset: 2px;
+}
+
+/* Forge prompt: a sentence, not a 4-letter code. */
+.forge-card {
+  width: min(460px, 100%);
+  border-color: rgba(255, 180, 77, 0.55);
+}
+.forge-card label {
+  color: #ffb44d;
+}
+.forge-card input {
+  font: 600 17px "Segoe UI", system-ui, sans-serif;
+  letter-spacing: normal;
+  text-transform: none;
+  text-align: left;
+  padding: 10px 12px;
+}
+.forge-card input:focus {
+  outline-color: #ffb44d;
+}
+.forge-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: rgba(230, 244, 255, 0.7);
 }
 
 .code-error {
@@ -356,18 +387,31 @@ body::after {
 }
 
 /* ---- Squads inbox (Nexconn Chat UI) ---- */
+/* Matches the ornate title screen (src/ui/ornate.ts): ember gold on dark steel, clipped corners. */
 .squads-button {
   position: fixed;
   z-index: 5;
   top: 16px;
   left: 16px;
-  font: 800 15px "Segoe UI", system-ui, sans-serif;
-  color: #eafcff;
-  padding: 10px 14px;
-  border: 1.5px solid #5dffb0;
-  border-radius: 12px;
-  background: rgba(8, 10, 20, 0.8);
+  font: 700 13px "Chakra Petch", "Segoe UI", system-ui, sans-serif;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #f1ebe3;
+  padding: 10px 16px 10px 18px;
+  border: 1.5px solid #9a5a30;
+  border-radius: 0;
+  clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+  background: linear-gradient(180deg, rgba(30, 35, 48, 0.92), rgba(14, 17, 25, 0.92));
+  box-shadow: inset 0 0 0 1px rgba(255, 157, 77, 0.18);
   cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.squads-button:hover,
+.squads-button:focus-visible {
+  color: #fff7e4;
+  border-color: #ff9d4d;
+  outline: none;
 }
 
 .squads-button[hidden] {
